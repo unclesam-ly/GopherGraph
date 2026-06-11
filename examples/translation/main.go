@@ -1,12 +1,13 @@
 package main
 
 import (
-	"GopherGraph"
 	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"strings"
+
+	GopherGraph "github.com/unclesam-LY/GopherGraph"
 )
 
 // TranslationState 代表我们工作流的共享状态（State）

@@ -73,3 +73,8 @@ func (g *Graph[S]) AddParallelEdges(from string, targets []string, next string, 
 		merger:  merger,
 	}
 }
+
+// HookFn 是节点执行前后的生命周期钩子函数签名。
+// nodeName 为当前执行的节点名称，state 为该节点执行时的状态快照（只读语义，请勿修改）。
+// 可通过此钩子接入日志、链路追踪（OpenTelemetry）、监控指标等能力，而无需修改任何 NodeFn。
+type HookFn[S any] func(ctx context.Context, nodeName string, state S)

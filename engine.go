@@ -96,7 +96,7 @@ func (cg *CompiledGraph[S]) Start(ctx context.Context, startNode string, initial
 		NextNode: startNode,
 	}
 
-	return cg.run(ctx, thread)
+	return cg.run(ctx, thread, runOptions[S]{})
 }
 
 // Resume 恢复执行一个被暂停的线程，并允许注入外部修改后的状态数据（例如人工审批修改后的结果）
@@ -112,15 +112,38 @@ func (cg *CompiledGraph[S]) Resume(ctx context.Context, thread *Thread[S], modif
 	thread.State = modifiedState
 	thread.IsPaused = false
 
-	return cg.run(ctx, thread)
+	return cg.run(ctx, thread, runOptions[S]{})
+}
+
+// runOptions 封装引擎运行时的可选参数，由 Engine 包装器传入
+type runOptions[S any] struct {
+	maxSteps     int
+	stateCloner  func(S) S
+	preNodeHook  HookFn[S]
+	postNodeHook HookFn[S]
 }
 
 // run 是引擎内部循环调度器，负责驱动节点向前流转
-func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S]) (*Thread[S], error) {
+func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts runOptions[S]) (*Thread[S], error) {
+	stepCount := 0
+
 	for {
-		// 检查 Context，支持外部超时控制或取消
-		if err := ctx.Err(); err != nil {
-			return thread, err
+		// 【熔断 1】检查步数上限，防御死循环（infinite loop protection）
+		if opts.maxSteps > 0 {
+			if stepCount >= opts.maxSteps {
+				return thread, fmt.Errorf(
+					"engine halt: max steps (%d) exceeded, possible infinite loop in graph",
+					opts.maxSteps,
+				)
+			}
+			stepCount++
+		}
+
+		// 【熔断 2】检查 Context，支持外部超时控制或取消
+		select {
+		case <-ctx.Done():
+			return thread, ctx.Err()
+		default:
 		}
 
 		currentNodeName := thread.NextNode
@@ -130,51 +153,38 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S]) (*Thread
 			return thread, nil
 		}
 
-		// 查找并执行当前节点
+		// 查找当前节点
 		nodeFn, exists := cg.nodes[currentNodeName]
 		if !exists {
 			return thread, fmt.Errorf("runtime error: node %q not found", currentNodeName)
 		}
 
+		// 触发 PreNodeHook
+		if opts.preNodeHook != nil {
+			opts.preNodeHook(ctx, currentNodeName, thread.State)
+		}
+
+		// 执行当前节点
 		newState, err := nodeFn(ctx, thread.State)
 		if err != nil {
 			return thread, fmt.Errorf("node %q execution error: %w", currentNodeName, err)
 		}
 		thread.State = newState
 
+		// 触发 PostNodeHook
+		if opts.postNodeHook != nil {
+			opts.postNodeHook(ctx, currentNodeName, thread.State)
+		}
+
 		// 计算下一个该执行的节点名称
 		var nextNode string
 		if step, isParallel := cg.parallels[currentNodeName]; isParallel {
-			// 【处理并发分流】
-			var wg sync.WaitGroup
-			branches := make([]S, len(step.targets))
-			errs := make([]error, len(step.targets))
-			for i, target := range step.targets {
-				wg.Add(1)
-				// 启动并发协程运行分支节点。传入 thread.State 的副本（Go 默认是值拷贝）
-				go func(idx int, targetNode string, stateCopy S) {
-					defer wg.Done()
-					if ctx.Err() != nil {
-						errs[idx] = ctx.Err()
-						return
-					}
-					nodeFn := cg.nodes[targetNode]
-					resState, err := nodeFn(ctx, stateCopy)
-					if err != nil {
-						errs[idx] = err
-						return
-					}
-					branches[idx] = resState
-				}(i, target, thread.State)
+			// 【处理并发分流】使用短路取消机制
+			branches, err := cg.runParallelBranches(ctx, step.targets, thread.State, opts.stateCloner)
+			if err != nil {
+				return thread, fmt.Errorf("parallel branch execution error: %w", err)
 			}
-			// 等待所有分支协程执行完毕
-			wg.Wait()
-			// 检查是否有任何分支报错
-			for _, err := range errs {
-				if err != nil {
-					return thread, fmt.Errorf("parallel branch execution error: %w", err)
-				}
-			}
+
 			// 【状态合并】调用用户自定义的合并函数
 			mergedState, err := step.merger(ctx, thread.State, branches)
 			if err != nil {
@@ -194,7 +204,7 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S]) (*Thread
 			nextNode = cg.edges[currentNodeName]
 		}
 
-		// 更新快照中的“下一个节点”
+		// 更新快照中的"下一个节点"
 		thread.NextNode = nextNode
 
 		// 如果下一站是终点，直接进入下一次循环触发结束逻辑
@@ -208,4 +218,83 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S]) (*Thread
 			return thread, nil // 暂停执行，返回当前快照供外部人工介入
 		}
 	}
+}
+
+// runParallelBranches 并发执行多个目标节点，并实现首个错误的短路取消。
+//
+//   - 使用 context.WithCancel 派生子 Context，任意分支报错立即调用 cancel()，
+//     通知其他仍在运行的分支通过 ctx.Done() 优雅退出，避免 AI 算力空转。
+//   - 使用缓冲 channel（容量 = 分支数）收集结果，防止 goroutine 在写入时永久阻塞（goroutine 泄漏）。
+//   - stateCloner 为可选的深拷贝函数；若为 nil，则传入值拷贝（对含引用类型的状态存在数据竞争风险，需用户知悉）。
+func (cg *CompiledGraph[S]) runParallelBranches(
+	ctx context.Context,
+	targets []string,
+	state S,
+	stateCloner func(S) S,
+) ([]S, error) {
+	// 派生可取消的子 Context：任意分支出错时，立即广播取消信号
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel() // 确保函数退出时释放资源，不论成功或失败
+
+	type result struct {
+		idx   int
+		state S
+		err   error
+	}
+
+	// 缓冲通道容量 = 分支数，确保所有 goroutine 均可不阻塞地写入结果
+	resultCh := make(chan result, len(targets))
+
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		wg.Add(1)
+
+		// 按需深拷贝状态：有 stateCloner 则深拷贝，否则值拷贝（Go 默认语义）
+		var stateCopy S
+		if stateCloner != nil {
+			stateCopy = stateCloner(state)
+		} else {
+			stateCopy = state
+		}
+
+		go func(idx int, nodeName string, s S) {
+			defer wg.Done()
+
+			// 在执行真正的工作之前，先检查是否已被其他分支取消
+			select {
+			case <-cancelCtx.Done():
+				resultCh <- result{idx: idx, err: cancelCtx.Err()}
+				return
+			default:
+			}
+
+			nodeFn := cg.nodes[nodeName]
+			resState, err := nodeFn(cancelCtx, s)
+			if err != nil {
+				cancel() // 关键：一处报错，立即取消其余所有兄弟 goroutine
+				resultCh <- result{idx: idx, err: err}
+				return
+			}
+			resultCh <- result{idx: idx, state: resState}
+		}(i, target, stateCopy)
+	}
+
+	// 等待所有 goroutine 完成后关闭结果通道
+	wg.Wait()
+	close(resultCh)
+
+	// 按索引顺序收集结果，保证合并函数收到的 branches 顺序与 targets 一致
+	branches := make([]S, len(targets))
+	for r := range resultCh {
+		if r.err != nil {
+			// 过滤掉因取消产生的次生错误，只返回第一个真实错误
+			if !errors.Is(r.err, context.Canceled) {
+				return nil, r.err
+			}
+		} else {
+			branches[r.idx] = r.state
+		}
+	}
+
+	return branches, nil
 }

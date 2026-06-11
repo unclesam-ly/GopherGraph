@@ -317,3 +317,138 @@ func TestFileCheckpointer(t *testing.T) {
 		t.Errorf("执行结果错误，最终值: %d, 是否结束: %t", thread.State.Value, thread.IsFinished)
 	}
 }
+
+// TestMaxStepsCircuitBreaker 验证 Engine.WithMaxSteps 能在步数超限时熔断，防止死循环
+func TestMaxStepsCircuitBreaker(t *testing.T) {
+	g := NewGraph[TestState]()
+
+	// 构造一个永远在 A -> B -> A 之间循环的图
+	g.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Value++
+		return s, nil
+	})
+	g.AddNode("B", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Value++
+		return s, nil
+	})
+
+	// A -> B -> A：形成闭环
+	g.AddEdge("A", "B")
+	g.AddEdge("B", "A")
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译图失败: %v", err)
+	}
+
+	// 设置最大步数为 5，图会在第 5 步触发熔断
+	engine := NewEngine(cg).WithMaxSteps(5)
+	_, err = engine.Start(context.Background(), "A", TestState{})
+	if err == nil {
+		t.Fatal("期望返回步数超限错误，实际无错误返回")
+	}
+	if !strings.Contains(err.Error(), "max steps") {
+		t.Errorf("期望错误信息包含 'max steps'，实际: %v", err)
+	}
+}
+
+// TestConcurrentCancellation 验证并发分支中一个节点报错时，其他兄弟节点能被及时取消
+func TestConcurrentCancellation(t *testing.T) {
+	g := NewGraph[TestState]()
+
+	g.AddNode("start", func(ctx context.Context, s TestState) (TestState, error) {
+		return s, nil
+	})
+	// task_fail：立即返回错误
+	g.AddNode("task_fail", func(ctx context.Context, s TestState) (TestState, error) {
+		return s, errors.New("task_fail intentional error")
+	})
+	// task_long：模拟耗时操作，应感知取消并提前退出
+	g.AddNode("task_long", func(ctx context.Context, s TestState) (TestState, error) {
+		select {
+		case <-time.After(5 * time.Second): // 5 秒，正常不应该跑完
+			s.Value = 999
+			return s, nil
+		case <-ctx.Done():
+			return s, ctx.Err()
+		}
+	})
+
+	g.AddParallelEdges("start", []string{"task_fail", "task_long"}, "", func(_ context.Context, parent TestState, _ []TestState) (TestState, error) {
+		return parent, nil
+	})
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译图失败: %v", err)
+	}
+
+	start := time.Now()
+	_, err = cg.Start(context.Background(), "start", TestState{})
+	elapsed := time.Since(start)
+
+	// 验证确实返回了错误
+	if err == nil {
+		t.Fatal("期望返回并发分支错误，实际无错误返回")
+	}
+	if !strings.Contains(err.Error(), "task_fail intentional error") {
+		t.Errorf("期望错误来自 task_fail，实际: %v", err)
+	}
+	// 验证 task_long 被快速取消，整个并发组的耗时远小于 5 秒
+	if elapsed > 2*time.Second {
+		t.Errorf("期望并发组在取消后快速结束（< 2s），实际耗时: %v", elapsed)
+	}
+}
+
+// TestLifecycleHooks 验证 Engine 的 Pre/Post 钩子在每个节点执行前后均被正确触发
+func TestLifecycleHooks(t *testing.T) {
+	g := NewGraph[TestState]()
+
+	g.AddNode("node1", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Value += 1
+		return s, nil
+	})
+	g.AddNode("node2", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Value += 10
+		return s, nil
+	})
+	g.AddEdge("node1", "node2")
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译图失败: %v", err)
+	}
+
+	var hookLog []string
+
+	engine := NewEngine(cg).
+		WithPreNodeHook(func(ctx context.Context, name string, s TestState) {
+			hookLog = append(hookLog, "pre:"+name)
+		}).
+		WithPostNodeHook(func(ctx context.Context, name string, s TestState) {
+			hookLog = append(hookLog, "post:"+name)
+		})
+
+	thread, err := engine.Start(context.Background(), "node1", TestState{})
+	if err != nil {
+		t.Fatalf("启动图失败: %v", err)
+	}
+	if !thread.IsFinished {
+		t.Error("期望工作流运行结束")
+	}
+	// 最终值：node1(+1) -> node2(+10) = 11
+	if thread.State.Value != 11 {
+		t.Errorf("期望 Value 为 11，实际为 %d", thread.State.Value)
+	}
+
+	// 验证 Hook 触发顺序：pre:node1 -> post:node1 -> pre:node2 -> post:node2
+	expected := []string{"pre:node1", "post:node1", "pre:node2", "post:node2"}
+	if len(hookLog) != len(expected) {
+		t.Fatalf("期望 %d 次 hook 触发，实际 %d 次: %v", len(expected), len(hookLog), hookLog)
+	}
+	for i, entry := range expected {
+		if hookLog[i] != entry {
+			t.Errorf("第 %d 次 hook 期望 %q，实际 %q", i, entry, hookLog[i])
+		}
+	}
+}
