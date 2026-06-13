@@ -46,7 +46,7 @@ package main
 
 import (
     "context"
-    GopherGraph "github.com/unclesam-LY/GopherGraph"
+    GopherGraph "github.com/uncesam-ly/GopherGraph"
 )
 
 func main() {
@@ -187,7 +187,7 @@ package main
 
 import (
     "context"
-    GopherGraph "github.com/unclesam-LY/GopherGraph"
+    GopherGraph "github.com/uncesam-ly/GopherGraph"
 )
 
 func main() {
@@ -327,7 +327,7 @@ package main
 
 import (
     "context"
-    GopherGraph "github.com/unclesam-LY/GopherGraph"
+    GopherGraph "github.com/uncesam-ly/GopherGraph"
 )
 
 func main() {
