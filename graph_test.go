@@ -452,3 +452,226 @@ func TestLifecycleHooks(t *testing.T) {
 		}
 	}
 }
+
+// TestResumeErrors 验证 Resume 对非暂停/已结束线程的错误路径
+func TestResumeErrors(t *testing.T) {
+	g := NewGraph[TestState]()
+	g.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) {
+		return s, nil
+	})
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译图失败: %v", err)
+	}
+
+	// 1. Resume 非暂停的线程
+	thread := &Thread[TestState]{NextNode: "A"}
+	_, err = cg.Resume(context.Background(), thread, TestState{})
+	if !errors.Is(err, ErrNotPaused) {
+		t.Errorf("期望 ErrNotPaused，实际: %v", err)
+	}
+
+	// 2. Resume 已结束的线程
+	thread2 := &Thread[TestState]{IsPaused: true, IsFinished: true}
+	_, err = cg.Resume(context.Background(), thread2, TestState{})
+	if !errors.Is(err, ErrAlreadyFinished) {
+		t.Errorf("期望 ErrAlreadyFinished，实际: %v", err)
+	}
+
+	// 3. Engine.Resume 也应返回相同的哨兵错误
+	engine := NewEngine(cg)
+	_, err = engine.Resume(context.Background(), &Thread[TestState]{NextNode: "A"}, TestState{})
+	if !errors.Is(err, ErrNotPaused) {
+		t.Errorf("Engine.Resume: 期望 ErrNotPaused，实际: %v", err)
+	}
+}
+
+// TestCompileValidationErrors 验证 Compile 对各种非法图结构的校验
+func TestCompileValidationErrors(t *testing.T) {
+	// 1. 空图
+	g1 := NewGraph[TestState]()
+	_, err := g1.Compile()
+	if err == nil || !strings.Contains(err.Error(), "no nodes") {
+		t.Errorf("空图应报错: %v", err)
+	}
+
+	// 2. 边指向不存在的节点
+	g2 := NewGraph[TestState]()
+	g2.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) { return s, nil })
+	g2.AddEdge("A", "nonexistent")
+	_, err = g2.Compile()
+	if err == nil || !strings.Contains(err.Error(), "destination") {
+		t.Errorf("边指向不存在节点应报 destination 错误: %v", err)
+	}
+
+	// 3. 中断节点不存在
+	g3 := NewGraph[TestState]()
+	g3.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) { return s, nil })
+	g3.AddInterrupt("ghost")
+	_, err = g3.Compile()
+	if err == nil || !strings.Contains(err.Error(), "interrupt") {
+		t.Errorf("不存在的中断节点应报错: %v", err)
+	}
+}
+
+// TestCompileEdgeConflict 验证同一节点不能同时存在于多种出边类型中
+func TestCompileEdgeConflict(t *testing.T) {
+	g := NewGraph[TestState]()
+	g.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) { return s, nil })
+	g.AddNode("B", func(ctx context.Context, s TestState) (TestState, error) { return s, nil })
+
+	// 同时为 A 设置静态边和条件路由
+	g.AddEdge("A", "B")
+	g.AddConditionalEdges("A", func(ctx context.Context, s TestState) (string, error) {
+		return "B", nil
+	})
+
+	_, err := g.Compile()
+	if err == nil || !strings.Contains(err.Error(), "conflicting") {
+		t.Errorf("出边冲突应报错: %v", err)
+	}
+}
+
+// TestRouterReturnsNonExistentNode 验证路由函数返回不存在的节点名时的运行时错误
+func TestRouterReturnsNonExistentNode(t *testing.T) {
+	g := NewGraph[TestState]()
+	g.AddNode("start", func(ctx context.Context, s TestState) (TestState, error) { return s, nil })
+	g.AddConditionalEdges("start", func(ctx context.Context, s TestState) (string, error) {
+		return "nonexistent_node", nil
+	})
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译图失败: %v", err)
+	}
+
+	_, err = cg.Start(context.Background(), "start", TestState{})
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("路由到不存在节点应返回 runtime error: %v", err)
+	}
+}
+
+// TestParallelWithStateCloner 验证 StateCloner 在并发分支中正确隔离引用类型
+func TestParallelWithStateCloner(t *testing.T) {
+	g := NewGraph[TestState]()
+
+	g.AddNode("start", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Log = append(s.Log, "start")
+		return s, nil
+	})
+	// 两个分支都向 Log 切片追加元素
+	g.AddNode("branch1", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Log = append(s.Log, "branch1")
+		s.Value = 10
+		return s, nil
+	})
+	g.AddNode("branch2", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Log = append(s.Log, "branch2")
+		s.Value = 20
+		return s, nil
+	})
+
+	g.AddParallelEdges("start", []string{"branch1", "branch2"}, "",
+		func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) {
+			for _, b := range branches {
+				parent.Value += b.Value
+			}
+			return parent, nil
+		},
+	)
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译图失败: %v", err)
+	}
+
+	// 使用 Engine + StateCloner 运行
+	engine := NewEngine(cg).WithStateCloner(func(s TestState) TestState {
+		clone := s
+		clone.Log = append([]string{}, s.Log...)
+		return clone
+	})
+
+	thread, err := engine.Start(context.Background(), "start", TestState{})
+	if err != nil {
+		t.Fatalf("启动图失败: %v", err)
+	}
+	if thread.State.Value != 30 {
+		t.Errorf("期望 Value 为 30，实际为 %d", thread.State.Value)
+	}
+}
+
+// TestHookChaining 验证多次调用 WithPreNodeHook/WithPostNodeHook 时钩子按顺序叠加
+func TestHookChaining(t *testing.T) {
+	g := NewGraph[TestState]()
+	g.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) {
+		return s, nil
+	})
+	cg, _ := g.Compile()
+
+	var log []string
+	engine := NewEngine(cg).
+		WithPreNodeHook(func(ctx context.Context, name string, s TestState) {
+			log = append(log, "pre1:"+name)
+		}).
+		WithPreNodeHook(func(ctx context.Context, name string, s TestState) {
+			log = append(log, "pre2:"+name)
+		}).
+		WithPostNodeHook(func(ctx context.Context, name string, s TestState) {
+			log = append(log, "post1:"+name)
+		}).
+		WithPostNodeHook(func(ctx context.Context, name string, s TestState) {
+			log = append(log, "post2:"+name)
+		})
+
+	engine.Start(context.Background(), "A", TestState{})
+
+	expected := []string{"pre1:A", "pre2:A", "post1:A", "post2:A"}
+	if len(log) != len(expected) {
+		t.Fatalf("期望 %d 次 hook 触发，实际 %d 次: %v", len(expected), len(log), log)
+	}
+	for i, entry := range expected {
+		if log[i] != entry {
+			t.Errorf("第 %d 次 hook 期望 %q，实际 %q", i, entry, log[i])
+		}
+	}
+}
+
+// TestCheckpointerThreadIDValidation 验证 FileCheckpointer 对恶意 threadID 的防御
+func TestCheckpointerThreadIDValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	fc, err := NewFileCheckpointer[TestState](tmpDir)
+	if err != nil {
+		t.Fatalf("创建 FileCheckpointer 失败: %v", err)
+	}
+
+	thread := &Thread[TestState]{State: TestState{Value: 1}}
+	ctx := context.Background()
+
+	// 空 ID
+	if err := fc.Save(ctx, "", thread); err == nil {
+		t.Error("空 threadID 应报错")
+	}
+
+	// 路径穿越
+	if err := fc.Save(ctx, "../escape", thread); err == nil {
+		t.Error("包含 .. 的 threadID 应报错")
+	}
+
+	// 目录分隔符
+	if err := fc.Save(ctx, "sub/dir", thread); err == nil {
+		t.Error("包含 / 的 threadID 应报错")
+	}
+
+	// Load 同样校验
+	_, err = fc.Load(ctx, "../escape")
+	if err == nil {
+		t.Error("Load 包含 .. 的 threadID 应报错")
+	}
+
+	// 合法 ID 应成功
+	if err := fc.Save(ctx, "valid-id_123", thread); err != nil {
+		t.Errorf("合法 threadID 不应报错: %v", err)
+	}
+}
+

@@ -76,7 +76,15 @@ func (e *Engine[S]) WithMaxSteps(n int) *Engine[S] {
 // 钩子函数接收到的 state 是节点执行【前】的状态快照，请勿修改（只读语义）。
 // 钩子中的 panic 会向上传播，建议在内部做好 recover。
 func (e *Engine[S]) WithPreNodeHook(fn HookFn[S]) *Engine[S] {
-	e.preNodeHook = fn
+	if e.preNodeHook == nil {
+		e.preNodeHook = fn
+	} else {
+		prev := e.preNodeHook
+		e.preNodeHook = func(ctx context.Context, name string, s S) {
+			prev(ctx, name, s)
+			fn(ctx, name, s)
+		}
+	}
 	return e
 }
 
@@ -89,7 +97,15 @@ func (e *Engine[S]) WithPreNodeHook(fn HookFn[S]) *Engine[S] {
 //
 // 钩子函数接收到的 state 是节点执行【后】更新过的状态，同为只读语义。
 func (e *Engine[S]) WithPostNodeHook(fn HookFn[S]) *Engine[S] {
-	e.postNodeHook = fn
+	if e.postNodeHook == nil {
+		e.postNodeHook = fn
+	} else {
+		prev := e.postNodeHook
+		e.postNodeHook = func(ctx context.Context, name string, s S) {
+			prev(ctx, name, s)
+			fn(ctx, name, s)
+		}
+	}
 	return e
 }
 
@@ -117,10 +133,10 @@ func (e *Engine[S]) Start(ctx context.Context, startNode string, initialState S)
 // 但会附加所有已注册的 Engine 增强选项（Hooks、MaxSteps、StateCloner）。
 func (e *Engine[S]) Resume(ctx context.Context, thread *Thread[S], modifiedState S) (*Thread[S], error) {
 	if !thread.IsPaused {
-		return nil, errNotPaused
+		return nil, ErrNotPaused
 	}
 	if thread.IsFinished {
-		return nil, errAlreadyFinished
+		return nil, ErrAlreadyFinished
 	}
 
 	thread.State = modifiedState
@@ -129,12 +145,4 @@ func (e *Engine[S]) Resume(ctx context.Context, thread *Thread[S], modifiedState
 	return e.graph.run(ctx, thread, e.opts())
 }
 
-// 复用与 CompiledGraph.Resume 中相同的哨兵错误，避免魔法字符串重复
-var (
-	errNotPaused       = errStr("cannot resume: thread is not paused")
-	errAlreadyFinished = errStr("cannot resume: thread is already finished")
-)
 
-type errStr string
-
-func (e errStr) Error() string { return string(e) }

@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	GopherGraph "github.com/unclesam-LY/GopherGraph"
+	GopherGraph "github.com/unclesam-ly/GopherGraph"
 )
 
 // TranslationState 代表我们工作流的共享状态（State）

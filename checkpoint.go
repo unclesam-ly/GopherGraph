@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Checkpointer 定义了持久化状态的接口，S 是工作流的强类型状态。
@@ -31,8 +32,13 @@ func NewFileCheckpointer[S any](dir string) (*FileCheckpointer[S], error) {
 	return &FileCheckpointer[S]{dir: dir}, nil
 }
 
-// Save 将 Thread 序列化为 JSON 并写入本地文件
+// Save 将 Thread 序列化为 JSON 并写入本地文件。
+// 采用“先写临时文件再原子重命名”的方式，防止写入中途程序崩溃导致文件损坏。
 func (fc *FileCheckpointer[S]) Save(ctx context.Context, threadID string, thread *Thread[S]) error {
+	if err := validateThreadID(threadID); err != nil {
+		return err
+	}
+
 	path := filepath.Join(fc.dir, threadID+".json")
 
 	// 使用 MarshalIndent 方便人工阅读生成的 JSON 文件
@@ -41,11 +47,23 @@ func (fc *FileCheckpointer[S]) Save(ctx context.Context, threadID string, thread
 		return fmt.Errorf("failed to marshal thread: %w", err)
 	}
 
-	return os.WriteFile(path, data, 0644)
+	// 原子写入：先写临时文件，再 Rename 替换，确保断电/崩溃安全
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	return nil
 }
 
 // Load 从本地文件中读取 JSON 并反序列化为 Thread。
 func (fc *FileCheckpointer[S]) Load(ctx context.Context, threadID string) (*Thread[S], error) {
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+
 	path := filepath.Join(fc.dir, threadID+".json")
 
 	data, err := os.ReadFile(path)
@@ -59,4 +77,16 @@ func (fc *FileCheckpointer[S]) Load(ctx context.Context, threadID string) (*Thre
 	}
 
 	return &thread, nil
+}
+
+// validateThreadID 校验 threadID 的合法性，防止路径穿越（path traversal）攻击。
+// threadID 中不允许出现目录分隔符或 ".." 序列。
+func validateThreadID(id string) error {
+	if id == "" {
+		return fmt.Errorf("threadID must not be empty")
+	}
+	if strings.ContainsAny(id, "/\\") || strings.Contains(id, "..") {
+		return fmt.Errorf("threadID %q contains invalid characters", id)
+	}
+	return nil
 }

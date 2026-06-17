@@ -37,7 +37,7 @@ func (g *Graph[S]) Compile() (*CompiledGraph[S], error) {
 			return nil, fmt.Errorf("compile error: edge origin %q does not exist", from)
 		}
 		if _, exists := g.nodes[to]; !exists {
-			return nil, fmt.Errorf("compile error: edge origin %q does not exist", to)
+			return nil, fmt.Errorf("compile error: edge destination %q does not exist", to)
 		}
 	}
 
@@ -79,15 +79,59 @@ func (g *Graph[S]) Compile() (*CompiledGraph[S], error) {
 		}
 	}
 
-	// 返回编译好的只读图
+	// 校验同一节点的出边冲突：不能同时存在于 edges、conditional、parallels 中
+	for node := range g.nodes {
+		conflictCount := 0
+		if _, ok := g.edges[node]; ok {
+			conflictCount++
+		}
+		if _, ok := g.conditional[node]; ok {
+			conflictCount++
+		}
+		if _, ok := g.parallels[node]; ok {
+			conflictCount++
+		}
+		if conflictCount > 1 {
+			return nil, fmt.Errorf("compile error: node %q has conflicting outgoing edges (defined in multiple edge types simultaneously)", node)
+		}
+	}
+
+	// 返回编译好的只读图（防御性拷贝，阻止编译后修改 Graph 对 CompiledGraph 造成污染）
+	nodesCopy := make(map[string]NodeFn[S], len(g.nodes))
+	for k, v := range g.nodes {
+		nodesCopy[k] = v
+	}
+	edgesCopy := make(map[string]string, len(g.edges))
+	for k, v := range g.edges {
+		edgesCopy[k] = v
+	}
+	conditionalCopy := make(map[string]RouterFn[S], len(g.conditional))
+	for k, v := range g.conditional {
+		conditionalCopy[k] = v
+	}
+	interruptsCopy := make(map[string]bool, len(g.interrupts))
+	for k, v := range g.interrupts {
+		interruptsCopy[k] = v
+	}
+	parallelsCopy := make(map[string]parallelStep[S], len(g.parallels))
+	for k, v := range g.parallels {
+		parallelsCopy[k] = v
+	}
+
 	return &CompiledGraph[S]{
-		nodes:       g.nodes,
-		edges:       g.edges,
-		conditional: g.conditional,
-		interrupts:  g.interrupts,
-		parallels:   g.parallels,
+		nodes:       nodesCopy,
+		edges:       edgesCopy,
+		conditional: conditionalCopy,
+		interrupts:  interruptsCopy,
+		parallels:   parallelsCopy,
 	}, nil
 }
+
+// ErrNotPaused 在调用 Resume 时线程未处于暂停状态时返回。可用于 errors.Is 判断。
+var ErrNotPaused = errors.New("cannot resume: thread is not paused")
+
+// ErrAlreadyFinished 在调用 Resume 时线程已结束时返回。可用于 errors.Is 判断。
+var ErrAlreadyFinished = errors.New("cannot resume: thread is already finished")
 
 // Start 从指定的起始节点开始运行图，并持续流转，直到遇到中断或运行结束
 func (cg *CompiledGraph[S]) Start(ctx context.Context, startNode string, initialState S) (*Thread[S], error) {
@@ -102,10 +146,10 @@ func (cg *CompiledGraph[S]) Start(ctx context.Context, startNode string, initial
 // Resume 恢复执行一个被暂停的线程，并允许注入外部修改后的状态数据（例如人工审批修改后的结果）
 func (cg *CompiledGraph[S]) Resume(ctx context.Context, thread *Thread[S], modifiedState S) (*Thread[S], error) {
 	if !thread.IsPaused {
-		return nil, errors.New("cannot resume: thread is not paused")
+		return nil, ErrNotPaused
 	}
 	if thread.IsFinished {
-		return nil, errors.New("cannot resume: thread is already finished")
+		return nil, ErrAlreadyFinished
 	}
 
 	// 注入人工修改后的状态，并解除暂停标记
@@ -206,11 +250,6 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 
 		// 更新快照中的"下一个节点"
 		thread.NextNode = nextNode
-
-		// 如果下一站是终点，直接进入下一次循环触发结束逻辑
-		if nextNode == "" {
-			continue
-		}
 
 		// 核心中断机制：如果即将进入的下一个节点被标记为了中断节点，则在此挂起
 		if cg.interrupts[nextNode] {
