@@ -3,6 +3,7 @@ package GopherGraph
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -256,7 +257,7 @@ func TestParallelExecution(t *testing.T) {
 func TestFileCheckpointer(t *testing.T) {
 	// 创建测试临时文件夹（测试结束后 Go 会自动清理）
 	tmpDir := t.TempDir()
-	fc, err := NewFileCheckpointer[TestState](tmpDir)
+	fc, err := NewFileCheckpointer[TestState](tmpDir, WithPrettyJSON())
 	if err != nil {
 		t.Fatalf("创建文件检查点管理器失败: %v", err)
 	}
@@ -315,6 +316,28 @@ func TestFileCheckpointer(t *testing.T) {
 	// 验证最终执行结果: 500 + 200 = 700
 	if !thread.IsFinished || thread.State.Value != 700 {
 		t.Errorf("执行结果错误，最终值: %d, 是否结束: %t", thread.State.Value, thread.IsFinished)
+	}
+
+	// 5. 保存已完结的线程，Load 后应附带 ErrAlreadyFinished 提示
+	if err := fc.Save(ctx, sessionID, thread); err != nil {
+		t.Fatalf("保存已完结线程失败: %v", err)
+	}
+	_, loadErr := fc.Load(ctx, sessionID)
+	if !errors.Is(loadErr, ErrAlreadyFinished) {
+		t.Errorf("Load 已完结线程应附带 ErrAlreadyFinished，实际: %v", loadErr)
+	}
+
+	// 6. Delete 后文件应不存在
+	if err := fc.Delete(ctx, sessionID); err != nil {
+		t.Fatalf("删除检查点失败: %v", err)
+	}
+	_, err = fc.Load(ctx, sessionID)
+	if err == nil {
+		t.Error("删除后 Load 应报错（文件不存在）")
+	}
+	// 幂等：重复 Delete 不应报错
+	if err := fc.Delete(ctx, sessionID); err != nil {
+		t.Errorf("重复 Delete 应幂等不报错，实际: %v", err)
 	}
 }
 
@@ -512,6 +535,35 @@ func TestCompileValidationErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "interrupt") {
 		t.Errorf("不存在的中断节点应报错: %v", err)
 	}
+
+	// 4. 重复注册节点和边
+	g4 := NewGraph[TestState]()
+	g4.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) { return s, nil })
+	g4.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) { return s, nil }) // 重复节点
+	g4.AddEdge("A", "B")
+	g4.AddEdge("A", "C") // 重复静态边
+	g4.AddConditionalEdges("A", func(ctx context.Context, s TestState) (string, error) { return "B", nil })
+	g4.AddConditionalEdges("A", func(ctx context.Context, s TestState) (string, error) { return "C", nil }) // 重复条件边
+	g4.AddParallelEdges("A", []string{"B"}, "", func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) { return parent, nil })
+	g4.AddParallelEdges("A", []string{"C"}, "", func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) { return parent, nil }) // 重复并发边
+	
+	_, err = g4.Compile()
+	if err == nil {
+		t.Fatal("重复注册应报错")
+	}
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "already registered") {
+		t.Errorf("应包含节点重复错误: %v", err)
+	}
+	if !strings.Contains(errMsg, "static edge registered") {
+		t.Errorf("应包含静态边重复错误: %v", err)
+	}
+	if !strings.Contains(errMsg, "conditional edge registered") {
+		t.Errorf("应包含条件边重复错误: %v", err)
+	}
+	if !strings.Contains(errMsg, "parallel edges registered") {
+		t.Errorf("应包含并发边重复错误: %v", err)
+	}
 }
 
 // TestCompileEdgeConflict 验证同一节点不能同时存在于多种出边类型中
@@ -673,5 +725,36 @@ func TestCheckpointerThreadIDValidation(t *testing.T) {
 	if err := fc.Save(ctx, "valid-id_123", thread); err != nil {
 		t.Errorf("合法 threadID 不应报错: %v", err)
 	}
+
+	// Delete 校验
+	if err := fc.Delete(ctx, "../escape"); err == nil {
+		t.Error("Delete 包含 .. 的 threadID 应报错")
+	}
 }
 
+// TestFileCheckpointerCompactJSON 验证默认格式为紧凑 JSON（不带缩进）
+func TestFileCheckpointerCompactJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 默认紧凑格式
+	fc, _ := NewFileCheckpointer[TestState](tmpDir)
+	thread := &Thread[TestState]{State: TestState{Value: 42}, NextNode: "A"}
+	_ = fc.Save(context.Background(), "compact", thread)
+
+	data, _ := os.ReadFile(tmpDir + "/compact.json")
+	if len(data) == 0 {
+		t.Fatal("文件为空")
+	}
+	// 紧凑格式不应包含换行符
+	if strings.Contains(string(data), "\n") {
+		t.Error("默认模式应为紧凑 JSON，不应包含换行符")
+	}
+
+	// WithPrettyJSON 模式应包含换行符
+	fcPretty, _ := NewFileCheckpointer[TestState](tmpDir, WithPrettyJSON())
+	_ = fcPretty.Save(context.Background(), "pretty", thread)
+	dataPretty, _ := os.ReadFile(tmpDir + "/pretty.json")
+	if !strings.Contains(string(dataPretty), "\n") {
+		t.Error("WithPrettyJSON 模式应包含换行符")
+	}
+}

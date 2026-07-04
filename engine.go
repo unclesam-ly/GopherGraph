@@ -27,6 +27,11 @@ type CompiledGraph[S any] struct {
 
 // Compile 校验图结构的合法性，并生成可运行的 CompiledGraph。
 func (g *Graph[S]) Compile() (*CompiledGraph[S], error) {
+	// 首先展示所有注册阶段积累的错误（如重复注册节点或边）
+	if err := errorsJoin(g.errs); err != nil {
+		return nil, fmt.Errorf("graph registration errors:\n%w", err)
+	}
+
 	if len(g.nodes) == 0 {
 		return nil, errors.New("cannot compile graph: graph contains no nodes")
 	}
@@ -133,6 +138,18 @@ var ErrNotPaused = errors.New("cannot resume: thread is not paused")
 // ErrAlreadyFinished 在调用 Resume 时线程已结束时返回。可用于 errors.Is 判断。
 var ErrAlreadyFinished = errors.New("cannot resume: thread is already finished")
 
+// validateResume 验证线程是否满足恢复执行的前提条件。
+// CompiledGraph.Resume 和 Engine.Resume 共用此逻辑，避免重复实现。
+func validateResume[S any](thread *Thread[S]) error {
+	if !thread.IsPaused {
+		return ErrNotPaused
+	}
+	if thread.IsFinished {
+		return ErrAlreadyFinished
+	}
+	return nil
+}
+
 // Start 从指定的起始节点开始运行图，并持续流转，直到遇到中断或运行结束
 func (cg *CompiledGraph[S]) Start(ctx context.Context, startNode string, initialState S) (*Thread[S], error) {
 	thread := &Thread[S]{
@@ -145,11 +162,8 @@ func (cg *CompiledGraph[S]) Start(ctx context.Context, startNode string, initial
 
 // Resume 恢复执行一个被暂停的线程，并允许注入外部修改后的状态数据（例如人工审批修改后的结果）
 func (cg *CompiledGraph[S]) Resume(ctx context.Context, thread *Thread[S], modifiedState S) (*Thread[S], error) {
-	if !thread.IsPaused {
-		return nil, ErrNotPaused
-	}
-	if thread.IsFinished {
-		return nil, ErrAlreadyFinished
+	if err := validateResume(thread); err != nil {
+		return nil, err
 	}
 
 	// 注入人工修改后的状态，并解除暂停标记
@@ -172,17 +186,6 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 	stepCount := 0
 
 	for {
-		// 【熔断 1】检查步数上限，防御死循环（infinite loop protection）
-		if opts.maxSteps > 0 {
-			if stepCount >= opts.maxSteps {
-				return thread, fmt.Errorf(
-					"engine halt: max steps (%d) exceeded, possible infinite loop in graph",
-					opts.maxSteps,
-				)
-			}
-			stepCount++
-		}
-
 		// 【熔断 2】检查 Context，支持外部超时控制或取消
 		select {
 		case <-ctx.Done():
@@ -195,6 +198,17 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 		if currentNodeName == "" {
 			thread.IsFinished = true
 			return thread, nil
+		}
+
+		// 【熔断 1】检查步数上限，防御死循环（infinite loop protection）
+		if opts.maxSteps > 0 {
+			if stepCount >= opts.maxSteps {
+				return thread, fmt.Errorf(
+					"engine halt: max steps (%d) exceeded, possible infinite loop in graph",
+					opts.maxSteps,
+				)
+			}
+			stepCount++
 		}
 
 		// 查找当前节点
@@ -241,6 +255,12 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 			next, err := routerFn(ctx, thread.State)
 			if err != nil {
 				return thread, fmt.Errorf("router for node %q execution error: %w", currentNodeName, err)
+			}
+			// 立即校验返回的节点是否存在，提供更清晰的报错
+			if next != "" {
+				if _, exists := cg.nodes[next]; !exists {
+					return thread, fmt.Errorf("router for node %q returned non-existent node %q (not found)", currentNodeName, next)
+				}
 			}
 			nextNode = next
 		} else {
@@ -322,17 +342,25 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 	wg.Wait()
 	close(resultCh)
 
-	// 按索引顺序收集结果，保证合并函数收到的 branches 顺序与 targets 一致
+	// 【P0 修复】先收集所有结果，再判断是否有真实错误。
+	// 原先在循环中遇到非 context.Canceled 错误就立即 return，但由于 channel 中的写入顺序是不确定的，
+	// 存在以下竞态：分支 A 先把 context.Canceled 写入 channel，紧接着分支 B 才把真实错误写入。
+	// 若此时早返回，真实错误永远不会被读取，调用方可能收到 nil error 而实际上有分支失败了。
+	// 解决方案：等全部结果到齐后，再过滤出第一个非取消的真实错误。
 	branches := make([]S, len(targets))
+	var firstErr error
 	for r := range resultCh {
 		if r.err != nil {
-			// 过滤掉因取消产生的次生错误，只返回第一个真实错误
-			if !errors.Is(r.err, context.Canceled) {
-				return nil, r.err
+			// 过滤掉因取消产生的次生错误，只记录第一个真实错误
+			if !errors.Is(r.err, context.Canceled) && firstErr == nil {
+				firstErr = r.err
 			}
 		} else {
 			branches[r.idx] = r.state
 		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	return branches, nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	GopherGraph "github.com/unclesam-ly/GopherGraph"
 )
@@ -122,7 +123,8 @@ func main() {
 	// 包含敏感词“秘密”，会触发人工审核中断：
 	inputText := "这是一个秘密你好"
 	fmt.Printf("🚀 启动工作流，输入原文: %q\n", inputText)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
 	thread, err := cg.Start(ctx, "translator", TranslationState{InputText: inputText})
 	if err != nil {
 		fmt.Printf("运行失败: %v\n", err)

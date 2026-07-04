@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	GopherGraph "github.com/unclesam-ly/GopherGraph"
@@ -82,7 +83,10 @@ func main() {
 	// ============================================================
 	// 使用 Engine 包装器，挂载所有增强能力
 	// ============================================================
-	var nodeTimings = make(map[string]time.Time)
+	var (
+		nodeTimings   = make(map[string]time.Time)
+		nodeTimingsMu sync.Mutex
+	)
 
 	engine := GopherGraph.NewEngine(cg).
 		// 1. 注册深拷贝函数，消除并发分支对 Messages 切片的数据竞争
@@ -91,13 +95,17 @@ func main() {
 		WithMaxSteps(50).
 		// 3. Pre Hook：记录节点开始时间 + 向控制台推送"流式进度"
 		WithPreNodeHook(func(ctx context.Context, name string, s AgentState) {
+			nodeTimingsMu.Lock()
 			nodeTimings[name] = time.Now()
+			nodeTimingsMu.Unlock()
 			fmt.Printf("  ⏳ [PRE ] %-15s | 消息数: %d\n", name, len(s.Messages))
 		}).
 		// 4. Post Hook：计算并打印节点耗时
 		WithPostNodeHook(func(ctx context.Context, name string, s AgentState) {
+			nodeTimingsMu.Lock()
 			elapsed := time.Since(nodeTimings[name])
-			fmt.Printf("  ✅ [POST] %-15s | 耗时: %v | 消息数: %d\n", name, elapsed.Round(time.Millisecond), len(s.Messages))
+			nodeTimingsMu.Unlock()
+			fmt.Printf("   [POST] %-15s | 耗时: %v | 消息数: %d\n", name, elapsed.Round(time.Millisecond), len(s.Messages))
 		})
 
 	fmt.Println("🚀 启动工作流...")

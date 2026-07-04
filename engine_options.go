@@ -1,6 +1,9 @@
 package GopherGraph
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // Engine 是 CompiledGraph 的增强包装器，在完全兼容原有 API 的基础上，
 // 提供以下四项生产级能力：
@@ -11,6 +14,12 @@ import "context"
 //  4. PostNodeHook   — 节点执行后的生命周期钩子（指标上报、流式推送等）
 //
 // 所有选项均为可选，通过链式调用注册。未注册的选项将退回到 CompiledGraph 的默认行为。
+//
+// # 线程安全说明
+//
+// Engine 使用 sync.RWMutex 保护配置字段，WithXxx 配置方法和 opts() 读取方法均加锁。
+// 因此，允许在 Start/Resume 运行期间并发调用 WithXxx 修改配置（但不推荐这样做）。
+// 常见的安全模式：在服务启动时一次性完成链式配置，之后多个 Goroutine 并发调用 Start/Resume。
 //
 // 用法示例：
 //
@@ -30,6 +39,7 @@ import "context"
 //
 //	thread, err := engine.Start(ctx, "start", initialState)
 type Engine[S any] struct {
+	mu           sync.RWMutex
 	graph        *CompiledGraph[S]
 	stateCloner  func(S) S
 	maxSteps     int
@@ -50,6 +60,8 @@ func NewEngine[S any](graph *CompiledGraph[S]) *Engine[S] {
 // 若不注册，引擎退化为 Go 默认的值拷贝语义（浅拷贝）。
 // 对于状态中含有引用类型的场景，强烈建议注册此函数。
 func (e *Engine[S]) WithStateCloner(fn func(S) S) *Engine[S] {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.stateCloner = fn
 	return e
 }
@@ -62,6 +74,8 @@ func (e *Engine[S]) WithStateCloner(fn func(S) S) *Engine[S] {
 // 建议根据工作流的预期最大深度合理设置（如 100~1000）。
 // 传入 0 或负数表示不限制（与不调用此方法等效）。
 func (e *Engine[S]) WithMaxSteps(n int) *Engine[S] {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.maxSteps = n
 	return e
 }
@@ -73,9 +87,12 @@ func (e *Engine[S]) WithMaxSteps(n int) *Engine[S] {
 //   - 记录 OpenTelemetry Span 的开始时间
 //   - 向前端推送"正在执行 xxx 节点"的流式事件
 //
+// 支持多次调用：每次调用将新钩子追加到执行链末尾，按注册顺序依次执行，不覆盖已有钩子。
 // 钩子函数接收到的 state 是节点执行【前】的状态快照，请勿修改（只读语义）。
 // 钩子中的 panic 会向上传播，建议在内部做好 recover。
 func (e *Engine[S]) WithPreNodeHook(fn HookFn[S]) *Engine[S] {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.preNodeHook == nil {
 		e.preNodeHook = fn
 	} else {
@@ -95,8 +112,11 @@ func (e *Engine[S]) WithPreNodeHook(fn HookFn[S]) *Engine[S] {
 //   - 上报节点耗时指标（Prometheus/DataDog）
 //   - 向前端推送节点执行完毕的流式事件
 //
+// 支持多次调用：每次调用将新钩子追加到执行链末尾，按注册顺序依次执行，不覆盖已有钩子。
 // 钩子函数接收到的 state 是节点执行【后】更新过的状态，同为只读语义。
 func (e *Engine[S]) WithPostNodeHook(fn HookFn[S]) *Engine[S] {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.postNodeHook == nil {
 		e.postNodeHook = fn
 	} else {
@@ -109,8 +129,11 @@ func (e *Engine[S]) WithPostNodeHook(fn HookFn[S]) *Engine[S] {
 	return e
 }
 
-// opts 将 Engine 的配置打包成 runOptions，传入底层 run() 调度器。
+// opts 将 Engine 的配置快照打包成 runOptions，传入底层 run() 调度器。
+// 使用 RLock 保证读取配置时的并发安全。
 func (e *Engine[S]) opts() runOptions[S] {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return runOptions[S]{
 		maxSteps:     e.maxSteps,
 		stateCloner:  e.stateCloner,
@@ -131,12 +154,10 @@ func (e *Engine[S]) Start(ctx context.Context, startNode string, initialState S)
 
 // Resume 恢复执行一个被暂停的线程，行为与 CompiledGraph.Resume 完全一致，
 // 但会附加所有已注册的 Engine 增强选项（Hooks、MaxSteps、StateCloner）。
+// 复用 validateResume 进行前提条件校验，与 CompiledGraph.Resume 保持一致。
 func (e *Engine[S]) Resume(ctx context.Context, thread *Thread[S], modifiedState S) (*Thread[S], error) {
-	if !thread.IsPaused {
-		return nil, ErrNotPaused
-	}
-	if thread.IsFinished {
-		return nil, ErrAlreadyFinished
+	if err := validateResume(thread); err != nil {
+		return nil, err
 	}
 
 	thread.State = modifiedState
@@ -144,5 +165,3 @@ func (e *Engine[S]) Resume(ctx context.Context, thread *Thread[S], modifiedState
 
 	return e.graph.run(ctx, thread, e.opts())
 }
-
-

@@ -1,6 +1,10 @@
 package GopherGraph
 
-import "context"
+import (
+	"context"
+	"errors"
+	"fmt"
+)
 
 // NodeFn 代表图中的一个执行节点（Agent）。
 // 它接收当前的上下文和状态 S，处理后返回更新后的状态 S，或者返回错误。
@@ -27,6 +31,7 @@ type Graph[S any] struct {
 	conditional map[string]RouterFn[S]     // 条件路由边：源节点 -> 路由函数
 	interrupts  map[string]bool            // 标记需要中断的节点：执行完该节点后挂起
 	parallels   map[string]parallelStep[S] // 并发分支：源节点 -> 并发步骤配置
+	errs        []error                    // 注册阶段的错误积累（重复注册等），在 Compile 时统一报告
 }
 
 // NewGraph 创建并初始化一个全新强类型的图构建器
@@ -36,27 +41,43 @@ func NewGraph[S any]() *Graph[S] {
 		edges:       make(map[string]string),
 		conditional: make(map[string]RouterFn[S]),
 		interrupts:  make(map[string]bool),
-		parallels:   make(map[string]parallelStep[S]), // 初始化 parallels
+		parallels:   make(map[string]parallelStep[S]),
 	}
 }
 
-// AddNode 向图中注册一个节点（Agent）
+// AddNode 向图中注册一个节点（Agent）。
+// 若同名节点已被注册，不会覆盖原有节点，错误将在 Compile() 时统一报告。
 func (g *Graph[S]) AddNode(name string, fn NodeFn[S]) {
+	if _, exists := g.nodes[name]; exists {
+		g.errs = append(g.errs, fmt.Errorf("AddNode: node %q is already registered", name))
+		return
+	}
 	g.nodes[name] = fn
 }
 
-// AddEdge 建立一条从 from 节点到 to 节点的静态连接线
+// AddEdge 建立一条从 from 节点到 to 节点的静态连接线。
+// 若 from 节点已有静态出边，不会覆盖，错误将在 Compile() 时统一报告。
 func (g *Graph[S]) AddEdge(from, to string) {
+	if _, exists := g.edges[from]; exists {
+		g.errs = append(g.errs, fmt.Errorf("AddEdge: node %q already has a static edge registered", from))
+		return
+	}
 	g.edges[from] = to
 }
 
 // AddConditionalEdges 建立一条从 from 节点出发的条件路由
-// 到底去哪，由 router 函数在运行时根据当前 State 动态决定
+// 到底去哪，由 router 函数在运行时根据当前 State 动态决定。
+// 若 from 节点已有条件出边，不会覆盖，错误将在 Compile() 时统一报告。
 func (g *Graph[S]) AddConditionalEdges(from string, router RouterFn[S]) {
+	if _, exists := g.conditional[from]; exists {
+		g.errs = append(g.errs, fmt.Errorf("AddConditionalEdges: node %q already has a conditional edge registered", from))
+		return
+	}
 	g.conditional[from] = router
 }
 
-// AddInterrupt 标记在执行 nodeName 节点“之前”进行中断挂起，等待人工确认
+// AddInterrupt 标记在执行 nodeName 节点"之前"进行中断挂起，等待人工确认。
+// 重复标记同一节点为幂等操作（设置 true 再设置 true，无副作用）。
 func (g *Graph[S]) AddInterrupt(nodeName string) {
 	g.interrupts[nodeName] = true
 }
@@ -66,7 +87,12 @@ func (g *Graph[S]) AddInterrupt(nodeName string) {
 // targets: 需要并发执行的多个目标节点名称（如 "translate_en", "translate_fr"）
 // next: 所有并发节点运行完并合并后，下一步要去的节点（如 "publisher"）
 // merger: 用于合并各个并发分支状态的函数
+// 若 from 节点已有并发出边，不会覆盖，错误将在 Compile() 时统一报告。
 func (g *Graph[S]) AddParallelEdges(from string, targets []string, next string, merger ParallelMergeFn[S]) {
+	if _, exists := g.parallels[from]; exists {
+		g.errs = append(g.errs, fmt.Errorf("AddParallelEdges: node %q already has parallel edges registered", from))
+		return
+	}
 	g.parallels[from] = parallelStep[S]{
 		targets: targets,
 		next:    next,
@@ -78,3 +104,12 @@ func (g *Graph[S]) AddParallelEdges(from string, targets []string, next string, 
 // nodeName 为当前执行的节点名称，state 为该节点执行时的状态快照（只读语义，请勿修改）。
 // 可通过此钩子接入日志、链路追踪（OpenTelemetry）、监控指标等能力，而无需修改任何 NodeFn。
 type HookFn[S any] func(ctx context.Context, nodeName string, state S)
+
+// errorsJoin 兼容多个错误合并为一个，避免 errors.Join 输出格式不够友好。
+// 仅供内部 graph.errs 汇总使用。
+func errorsJoin(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
+}
