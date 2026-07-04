@@ -135,6 +135,11 @@ fc.Save(context.Background(), sessionID, thread)
 // 重启程序后，可以从磁盘重新加载进度并恢复执行
 loadedThread, _ := fc.Load(context.Background(), sessionID)
 thread, _ = cg.Resume(context.Background(), loadedThread, modifiedState)
+
+// 任务彻底跑完后，清理磁盘上的存档文件
+if thread.IsFinished {
+    fc.Delete(context.Background(), sessionID)
+}
 ```
 
 #### 运行内置示例
@@ -276,6 +281,11 @@ fc.Save(context.Background(), sessionID, thread)
 // Reload the snapshot (e.g. after a process restart) and resume
 loadedThread, _ := fc.Load(context.Background(), sessionID)
 thread, _ = cg.Resume(context.Background(), loadedThread, modifiedState)
+
+// Clean up the storage file once the workflow is completely finished
+if thread.IsFinished {
+    fc.Delete(context.Background(), sessionID)
+}
 ```
 
 #### Run the Interactive Demo
@@ -417,6 +427,11 @@ fc.Save(context.Background(), sessionID, thread)
 // スナップショットを読み込み、プロセス再起動後に処理を再開
 loadedThread, _ := fc.Load(context.Background(), sessionID)
 thread, _ = cg.Resume(context.Background(), loadedThread, modifiedState)
+
+// 処理が完全に終了した後、ストレージ上のファイルをクリーンアップする
+if thread.IsFinished {
+    fc.Delete(context.Background(), sessionID)
+}
 ```
 
 #### インタラクティブデモの実行
