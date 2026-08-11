@@ -26,7 +26,7 @@ Go 言語（ジェネリクス）で書かれた、軽量・高性能・型安�
 - **死循环硬性熔断：** 通过 `Engine.WithMaxSteps` 设置步数上限，图中的任何意外环路都会被明确报错而非无限阻塞。
 - **轻量级生命周期 Hooks（支持多重链式累加）：** `Engine.WithPreNodeHook` / `WithPostNodeHook` 支持多次调用链式累加（不覆盖已有钩子），无需修改 `NodeFn`，极易解耦日志、链路追踪（OpenTelemetry）或流式输出等逻辑。
 - **编译期结构校验：** 图在编译 (`Compile`) 时，不仅会验证所有节点和边是否存在，还会严格检测同一节点是否冲突地定义了多种出边类型（如同时定义静态边、条件边与并发边），规避多义性逻辑隐患。
-- **开箱即用持久化与安全校验：** 提供 `Checkpointer[S]` 接口与内置的 `FileCheckpointer[S]`，采用“先写临时文件再原子重命名”防损坏机制，并对 `threadID` 进行路径穿越防御性校验，实现进程意外退出后进度安全无损地恢复。
+- **开箱即用持久化与安全校验：** 提供 `Checkpointer[S]` 接口，内置基于 JSON 文件的 `FileCheckpointer[S]`（原子重命名防损坏）以及基于 SQLite 的 `SQLiteCheckpointer[S]`（支持多版本追加写入 Append-Only、历史版本回溯与剪枝），并对 `threadID` 进行路径穿越防御性校验，实现进程意外退出后进度安全无损地恢复。
 - **纯粹的高性能：** 基于内存流转，零外部依赖，极低的上下文切换开销。
 
 ### 快速开始
@@ -123,9 +123,11 @@ engine.Start(ctx, "start", MyState{})
 close(streamCh)
 ```
 
-#### 5. 文件持久化 (Checkpointer) 示例
+#### 5. 状态持久化 (Checkpointer) 示例
+
+##### A. 基于 JSON 本地文件的 Checkpointer
 ```go
-// 创建一个文件存储器，指定存放状态文件的目录
+// 创建文件存储器，指定存放状态文件的目录
 fc, _ := GopherGraph.NewFileCheckpointer[MyState]("./checkpoints")
 
 // 在遇到中断挂起时，将 thread 保存到磁盘
@@ -140,6 +142,29 @@ thread, _ = cg.Resume(context.Background(), loadedThread, modifiedState)
 if thread.IsFinished {
     fc.Delete(context.Background(), sessionID)
 }
+```
+
+##### B. 基于 SQLite 的多版本追加写入 (Append-Only) Checkpointer
+```go
+// 创建 SQLite 存储器，自动开启 WAL 高并发模式
+sc, _ := GopherGraph.NewSQLiteCheckpointer[MyState]("./checkpoints.db")
+defer sc.Close()
+
+// 每次 Save 都会追加写入一个新的版本号 (v1, v2, v3...)
+sessionID := "user-session-123"
+sc.Save(ctx, sessionID, thread)
+
+// Load 默认获取最新版本的线程快照
+latestThread, _ := sc.Load(ctx, sessionID)
+
+// LoadVersion 支持精确回溯并恢复指定历史版本的快照（版本重放/回滚）
+v1Thread, _ := sc.LoadVersion(ctx, sessionID, 1)
+
+// ListVersions 查询该 session 的所有历史版本元数据
+versions, _ := sc.ListVersions(ctx, sessionID)
+
+// PruneVersions 保留最近 N 个版本，自动清理过期历史
+sc.PruneVersions(ctx, sessionID, 5)
 ```
 
 #### 运行内置示例
@@ -173,7 +198,7 @@ go test -v -race ./...
 - **Infinite Loop Circuit Breaker:** Set a hard step limit with `Engine.WithMaxSteps`. Any accidental cycle in the graph returns a clear error instead of blocking forever.
 - **Lightweight Lifecycle Hooks (Additive Chaining):** `Engine.WithPreNodeHook` / `WithPostNodeHook` fire before and after each node without touching any `NodeFn` signature. Supports multiple chained registrations (additive) instead of overwriting, making it easy to decouple concerns like logging, tracing (OpenTelemetry), and streaming.
 - **Compile-Time Structural Validation:** During `Compile()`, the engine validates node/edge existence and strictly checks for outgoing edge conflicts on each node (e.g., preventing a node from simultaneously defining static, conditional, and parallel edges) to ensure unambiguous flow execution.
-- **State Persistence & Path Safety:** Generic `Checkpointer[S]` interface with built-in `FileCheckpointer[S]`. Uses an atomic write (temp-file write followed by rename) to prevent corruption, and includes path traversal validation on `threadID`.
+- **State Persistence & Path Safety:** Generic `Checkpointer[S]` interface with built-in `FileCheckpointer[S]` (atomic file rename) and `SQLiteCheckpointer[S]` (append-only multi-versioning, time travel history & pruning), featuring path traversal validation on `threadID`.
 - **Zero-Dependency & High-Performance:** Written in pure Go with zero external dependencies, leveraging in-memory queues for lightning-fast orchestration.
 
 ### Quick Start
@@ -270,6 +295,8 @@ close(streamCh)
 ```
 
 #### 5. State Persistence (Checkpointer) Example
+
+##### A. JSON File Checkpointer
 ```go
 // Initialize a local directory storage
 fc, _ := GopherGraph.NewFileCheckpointer[MyState]("./checkpoints")
@@ -286,6 +313,29 @@ thread, _ = cg.Resume(context.Background(), loadedThread, modifiedState)
 if thread.IsFinished {
     fc.Delete(context.Background(), sessionID)
 }
+```
+
+##### B. SQLite Append-Only Multi-Version Checkpointer
+```go
+// Initialize SQLite checkpointer (WAL mode enabled automatically)
+sc, _ := GopherGraph.NewSQLiteCheckpointer[MyState]("./checkpoints.db")
+defer sc.Close()
+
+// Append a new version snapshot on every Save (v1, v2, v3...)
+sessionID := "user-session-123"
+sc.Save(ctx, sessionID, thread)
+
+// Load gets the latest version by default
+latestThread, _ := sc.Load(ctx, sessionID)
+
+// LoadVersion fetches a specific historical version for replay/rollback
+v1Thread, _ := sc.LoadVersion(ctx, sessionID, 1)
+
+// ListVersions retrieves version metadata for the thread
+versions, _ := sc.ListVersions(ctx, sessionID)
+
+// PruneVersions retains the N most recent versions and purges older records
+sc.PruneVersions(ctx, sessionID, 5)
 ```
 
 #### Run the Interactive Demo
@@ -319,7 +369,7 @@ go test -v -race ./...
 - **無限ループのサーキットブレーカー:** `Engine.WithMaxSteps` でステップ数の上限を設定。グラフ内に意図しないサイクルが発生しても、永久ブロックせず明確なエラーを返します。
 - **軽量なライフサイクルフック（複数チェーン登録対応）:** `Engine.WithPreNodeHook` / `WithPostNodeHook` により、`NodeFn` のシグネチャを変更することなくロギング、トレーシング（OpenTelemetry）、ストリーミング出力を実装できます。**複数回呼び出すことで複数のフックを順番に実行（チェーン蓄積）**可能です。
 - **コンパイル時の構造検証:** `Compile()` 実行時に、すべてのノードや辺の存在をチェックするだけでなく、同一ノードに対する出辺タイプ（静的辺、条件付き辺、並行辺）の重複競合も厳密に検出し、意図しない曖昧な挙動を防ぎます。
-- **状態の永続化とパス安全性:** 抽象的な `Checkpointer[S]` インタフェースと、書き込み時の破損を防ぐアトミック書き込み（一時ファイルからリネーム）に対応した `FileCheckpointer[S]` を内蔵。`threadID` のパス・トラバーサル検証によりセキュアに状態の復旧が可能です。
+- **状態の永続化とパス安全性:** 抽象的な `Checkpointer[S]` インタフェースと、アトミック書き込み対応の `FileCheckpointer[S]`、およびマルチバージョン追記（Append-Only）・履歴復元に対応した `SQLiteCheckpointer[S]` を内蔵。`threadID` のパス・トラバーサル検証によりセキュアに状態の復旧が可能です。
 - **ピュア Go & 高性能:** 外部依存関係ゼロ。メモリ内チャネルを用いた高速なコンテキスト切り替え。
 
 ### クイックスタート
@@ -416,6 +466,8 @@ close(streamCh)
 ```
 
 #### 5. 状態の永続化（Checkpointer）のコード例
+
+##### A. JSON ファイル Checkpointer
 ```go
 // 保存先ディレクトリを指定してローカルファイルチェッカーを初期化
 fc, _ := GopherGraph.NewFileCheckpointer[MyState]("./checkpoints")
@@ -432,6 +484,29 @@ thread, _ = cg.Resume(context.Background(), loadedThread, modifiedState)
 if thread.IsFinished {
     fc.Delete(context.Background(), sessionID)
 }
+```
+
+##### B. SQLite マルチバージョン追記 (Append-Only) Checkpointer
+```go
+// SQLite チェッカーを初期化（WAL 高並行モードが自動有効化）
+sc, _ := GopherGraph.NewSQLiteCheckpointer[MyState]("./checkpoints.db")
+defer sc.Close()
+
+// Save のたびに新しいバージョン（v1, v2, v3...）を追記保存
+sessionID := "user-session-123"
+sc.Save(ctx, sessionID, thread)
+
+// Load はデフォルトで最新バージョンのスナップショットを取得
+latestThread, _ := sc.Load(ctx, sessionID)
+
+// LoadVersion は特定バージョンを正確に復元（タイムトラベル / 状態ロールバック）
+v1Thread, _ := sc.LoadVersion(ctx, sessionID, 1)
+
+// ListVersions で全履歴のメタデータ一覧を取得
+versions, _ := sc.ListVersions(ctx, sessionID)
+
+// PruneVersions で最新 N 件のみを保持し、古い履歴を削除
+sc.PruneVersions(ctx, sessionID, 5)
 ```
 
 #### インタラクティブデモの実行

@@ -11,9 +11,5 @@
 //   - [Engine] 增强包装器：通过 [NewEngine] 创建，在 CompiledGraph 基础上叠加
 //     StateCloner（深拷贝）、MaxSteps（死循环熔断）、PreNodeHook/PostNodeHook（生命周期钩子）。
 //   - [Thread] 执行快照：承载当前状态、下一节点、暂停/结束标记，可序列化用于断点恢复。
-//   - [Checkpointer] 持久化接口：提供 Save/Load/Delete 用于工作流进度存储和清理，内置 [FileCheckpointer] 实现基于 JSON 文件的状态存储。
-//
-// # 零外部依赖
-//
-// GopherGraph 仅使用 Go 标准库，无任何第三方依赖。
+//   - [Checkpointer] 持久化接口：提供 Save/Load/Delete 用于工作流进度存储和清理，内置 [FileCheckpointer] 基于 JSON 文件存储，以及 [SQLiteCheckpointer] 支持多版本追加写入（Append-Only）与版本回溯。
 package GopherGraph
