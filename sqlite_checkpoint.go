@@ -60,6 +60,9 @@ func WithSQLitePrettyJSON() SQLiteCheckpointerOption {
 var validTableNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 func validateTableName(name string) error {
+	if name == "" {
+		return fmt.Errorf("table name must not be empty")
+	}
 	if !validTableNameRegex.MatchString(name) {
 		return fmt.Errorf("invalid table name %q: must contain only alphanumeric characters and underscores", name)
 	}
@@ -79,6 +82,12 @@ func NewSQLiteCheckpointer[S any](dbPath string, opts ...SQLiteCheckpointerOptio
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
+	// 限制为单一共享连接：
+	// 1. 确保 PRAGMA WAL / busy_timeout 对所有请求生效（不会因多连接而失效）；
+	// 2. SQLite 单写者模型下，单连接消除 SQLITE_BUSY 并发写冲突。
+	// 读操作在 WAL 模式下仍可与写操作并行，性能不受影响。
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	sc, err := NewSQLiteCheckpointerWithDB[S](db, opts...)
 	if err != nil {
@@ -151,8 +160,14 @@ func (sc *SQLiteCheckpointer[S]) Save(ctx context.Context, threadID string, thre
 		return fmt.Errorf("thread must not be nil")
 	}
 
+	// Save 使用写锁（Lock）而非读锁：
+	// SELECT MAX(version) + INSERT 是两步操作，必须在应用层互斥，
+	// 防止并发 goroutine 读到相同的 maxVersion 并写入重复的版本号。
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	if sc.db == nil {
+		return fmt.Errorf("SQLiteCheckpointer is already closed")
+	}
 
 	var data []byte
 	var err error
@@ -212,6 +227,9 @@ func (sc *SQLiteCheckpointer[S]) Load(ctx context.Context, threadID string) (*Th
 
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
+	if sc.db == nil {
+		return nil, fmt.Errorf("SQLiteCheckpointer is already closed")
+	}
 
 	query := fmt.Sprintf("SELECT data FROM %s WHERE thread_id = ? ORDER BY version DESC LIMIT 1", sc.tableName)
 	var dataStr string
@@ -246,6 +264,9 @@ func (sc *SQLiteCheckpointer[S]) LoadVersion(ctx context.Context, threadID strin
 
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
+	if sc.db == nil {
+		return nil, fmt.Errorf("SQLiteCheckpointer is already closed")
+	}
 
 	query := fmt.Sprintf("SELECT data FROM %s WHERE thread_id = ? AND version = ?", sc.tableName)
 	var dataStr string
@@ -277,6 +298,9 @@ func (sc *SQLiteCheckpointer[S]) ListVersions(ctx context.Context, threadID stri
 
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
+	if sc.db == nil {
+		return nil, fmt.Errorf("SQLiteCheckpointer is already closed")
+	}
 
 	query := fmt.Sprintf("SELECT id, thread_id, version, next_node, is_paused, is_finished, created_at FROM %s WHERE thread_id = ? ORDER BY version ASC", sc.tableName)
 	rows, err := sc.db.QueryContext(ctx, query, threadID)
@@ -285,7 +309,8 @@ func (sc *SQLiteCheckpointer[S]) ListVersions(ctx context.Context, threadID stri
 	}
 	defer rows.Close()
 
-	var versions []CheckpointVersion
+	// 初始化为空 slice 而非 nil，使调用方无需区分 nil 与空列表两种情况
+	versions := make([]CheckpointVersion, 0)
 	for rows.Next() {
 		var v CheckpointVersion
 		if err := rows.Scan(&v.ID, &v.ThreadID, &v.Version, &v.NextNode, &v.IsPaused, &v.IsFinished, &v.CreatedAt); err != nil {
@@ -311,6 +336,9 @@ func (sc *SQLiteCheckpointer[S]) PruneVersions(ctx context.Context, threadID str
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	if sc.db == nil {
+		return fmt.Errorf("SQLiteCheckpointer is already closed")
+	}
 
 	query := fmt.Sprintf(`
 		DELETE FROM %s 
@@ -320,6 +348,7 @@ func (sc *SQLiteCheckpointer[S]) PruneVersions(ctx context.Context, threadID str
 		  )
 	`, sc.tableName, sc.tableName)
 
+	// threadID 传两次：第一个参数对应外层 WHERE，第二个对应子查询 WHERE
 	_, err := sc.db.ExecContext(ctx, query, threadID, threadID, keepN)
 	if err != nil {
 		return fmt.Errorf("failed to prune versions: %w", err)
@@ -335,6 +364,9 @@ func (sc *SQLiteCheckpointer[S]) Delete(ctx context.Context, threadID string) er
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	if sc.db == nil {
+		return fmt.Errorf("SQLiteCheckpointer is already closed")
+	}
 
 	query := fmt.Sprintf("DELETE FROM %s WHERE thread_id = ?", sc.tableName)
 	_, err := sc.db.ExecContext(ctx, query, threadID)
@@ -346,6 +378,9 @@ func (sc *SQLiteCheckpointer[S]) Delete(ctx context.Context, threadID string) er
 
 // Close 关闭由 NewSQLiteCheckpointer 创建的底层 SQLite 数据库连接。
 // 若数据库连接是由外部创建并传给 NewSQLiteCheckpointerWithDB 的，则调用 Close 为无操作（由外部管理）。
+//
+// Close 使用写锁（Lock），会等待所有进行中的 Save/Load 等操作（持有 RLock）全部完成后
+// 才将 sc.db 置 nil 并关闭连接，保证不会出现 use-after-close 的竞态问题。
 func (sc *SQLiteCheckpointer[S]) Close() error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
