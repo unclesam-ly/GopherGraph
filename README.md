@@ -33,7 +33,7 @@ Go 言語（ジェネリクス）で書かれた、軽量・高性能・型安�
 - **节点自动重试（指数退避）：** 支持通过 `Engine.WithRetryPolicy`（全局）与 `Engine.WithNodeRetryPolicy`（单节点）配置最大尝试次数、指数退避间隔及 `RetryIf` 错误过滤函数；自动跳过 `context.Canceled` / `context.DeadlineExceeded`，配合 `StateCloner` 保证每次重试状态隔离。
 - **编译期与运行时结构校验：** 图在编译 (`Compile`) 时会验证节点/边存在性、拦截并发目标节点上的中断配置，并严格检测同一节点的出边类型冲突；使用 `AddConditionalEdgesWithTargets` 声明可达目标后，还可在编译期静态校验目标存在性并在运行时拦截越界跳转。
 - **Mermaid 流程图导出：** 通过 `CompiledGraph.Mermaid()` 或 `Engine.Mermaid()` 一键导出确定性（Deterministic）的 `flowchart TD` 流程图，清晰区分普通节点、中断节点、条件分支与并发分流/合并边。
-- **显式可控的状态持久化：** 提供 `Checkpointer[S]` 接口，内置基于 JSON 文件的 `FileCheckpointer[S]`（原子重命名防损坏）以及基于纯 Go SQLite 的 `SQLiteCheckpointer[S]`（支持多版本追加写入 Append-Only、历史版本回溯与剪枝），并对 `threadID` 进行路径穿越防御性校验。持久化时机完全交由用户控制（按需在中断时保存，或通过 `WithPostNodeHook` 每步保存），不引入隐式 I/O 开销。
+- **显式可控的状态持久化：** 提供 `Checkpointer[S]` 接口，内置基于 JSON 文件的 `FileCheckpointer[S]`（原子重命名防损坏）以及基于纯 Go SQLite 的 `SQLiteCheckpointer[S]`（支持多版本追加写入 Append-Only、历史版本回溯与剪枝），并对 `threadID` 进行路径穿越防御性校验；同时提供 `Engine.WithSnapshotSaver` 回调，每步完成后返回包含 `Step`、`Node`、`Duration`（节点执行耗时）和完整 `Thread` 的 `StepSnapshot[S]`（支持 `ThreadJSON()` 一键序列化），方便直接存入用户的 MySQL / PostgreSQL / Redis 等自定义数据库，不引入隐式 I/O 开销。
 - **纯 Go 高性能与无 CGO：** 引擎核心基于内存与 Goroutine/Channel 流转，内置持久化均采用纯 Go 实现（零 CGO 依赖），具备极低的上下文切换开销。
 
 ### 快速开始
@@ -191,7 +191,30 @@ versions, _ := sc.ListVersions(ctx, sessionID)
 sc.PruneVersions(ctx, sessionID, 5)
 ```
 
-> 💡 持久化时机完全交由用户显式控制：你可以仅在 `thread.IsPaused` 时调用 `Save` 以保持零运行时 I/O 开销，也可以在 `Engine.WithPostNodeHook` 中调用 `Save` 实现每步自动存档。
+##### C. 自定义数据库回调 (Engine.WithSnapshotSaver)
+如果你希望将节点流转信息和快照直接存入自己的业务数据库（如 MySQL、PostgreSQL、Redis 等），可通过 `Engine.WithSnapshotSaver` 注册回调函数。每步路由计算与状态更新完成后，引擎会自动将包含步数、节点名、耗时（`Duration`）以及完整 `Thread` 的 `StepSnapshot[S]` 传给你：
+```go
+engine := GopherGraph.NewEngine(cg).
+    WithSnapshotSaver(func(ctx context.Context, snap GopherGraph.StepSnapshot[MyState]) error {
+        stateJSON, err := snap.ThreadJSON() // 一键序列化 Thread 为紧凑 JSON
+        if err != nil {
+            return err
+        }
+
+        // 将节点执行信息与快照写入用户自己的数据库（返回 error 会立即中止工作流）
+        return saveToMyDB(ctx, WorkflowRecord{
+            Step:       snap.Step,
+            Node:       snap.Node,
+            DurationMs: snap.Duration.Milliseconds(),
+            NextNode:   snap.Thread.NextNode,
+            IsPaused:   snap.Thread.IsPaused,
+            IsFinished: snap.Thread.IsFinished,
+            ThreadJSON: stateJSON,
+        })
+    })
+```
+
+> 💡 持久化时机完全交由用户显式控制：你可以仅在 `thread.IsPaused` 时调用 `Checkpointer.Save` 以保持零运行时 I/O 开销，也可以通过 `Engine.WithSnapshotSaver` 在每步路由与状态定型后自动写入你自己的数据库。
 
 #### 6. 条件目标校验与 Mermaid 流程图导出
 使用 `AddConditionalEdgesWithTargets` 声明条件路由可能到达的目标节点（传入 `""` 表示可直接结束工作流），即可在 `Compile()` 时静态检验目标存在性，并通过 `Mermaid()` 导出完整流程图：
@@ -245,7 +268,7 @@ go test -v -race ./...
 - **Automatic Node Retry (Exponential Backoff):** Configure global or per-node retry policies with `Engine.WithRetryPolicy` and `Engine.WithNodeRetryPolicy` (max attempts, exponential backoff, and custom `RetryIf` predicates). Automatically skips `context.Canceled` / `context.DeadlineExceeded`, and pairs with `StateCloner` to isolate state across retry attempts.
 - **Compile-Time & Runtime Structural Validation:** During `Compile()`, the engine validates node/edge existence, forbids interrupts on parallel target nodes, and strictly checks for outgoing edge conflicts on each node. Pair with `AddConditionalEdgesWithTargets` to validate conditional targets at compile time and block undeclared jumps at runtime.
 - **Mermaid Flowchart Export:** Export deterministic `flowchart TD` diagrams via `CompiledGraph.Mermaid()` or `Engine.Mermaid()`, visually distinguishing standard nodes, interrupt nodes, conditional routes, and parallel fan-out/merge edges.
-- **Explicit User-Controlled Persistence:** Generic `Checkpointer[S]` interface with built-in `FileCheckpointer[S]` (atomic file rename) and pure-Go `SQLiteCheckpointer[S]` (append-only multi-versioning, time travel history & pruning), featuring path traversal validation on `threadID`. Persistence timing remains fully under user control (save on pause or step-by-step via `WithPostNodeHook`) with zero forced I/O overhead.
+- **Explicit User-Controlled Persistence:** Generic `Checkpointer[S]` interface with built-in `FileCheckpointer[S]` (atomic file rename) and pure-Go `SQLiteCheckpointer[S]` (append-only multi-versioning, time travel history & pruning), featuring path traversal validation on `threadID`. Also provides `Engine.WithSnapshotSaver`, emitting a `StepSnapshot[S]` after every step with `Step`, `Node`, `Duration`, full `Thread`, and `ThreadJSON()` for saving directly into your own database (MySQL, PostgreSQL, Redis, etc.) with zero forced I/O overhead.
 - **Pure Go & High-Performance (CGO-Free):** The core engine runs purely in memory over Go Goroutines and Channels, and built-in persistence (including SQLite) requires zero CGO dependencies.
 
 ### Quick Start
@@ -402,7 +425,30 @@ versions, _ := sc.ListVersions(ctx, sessionID)
 sc.PruneVersions(ctx, sessionID, 5)
 ```
 
-> 💡 Persistence timing is explicitly controlled by your application: save only when `thread.IsPaused` for zero runtime I/O overhead, or call `Save` inside `Engine.WithPostNodeHook` for step-by-step checkpointing.
+##### C. Custom Database Callback (Engine.WithSnapshotSaver)
+If you want to store node execution details and thread snapshots directly in your own database (e.g., MySQL, PostgreSQL, Redis), register a callback via `Engine.WithSnapshotSaver`. After each step finishes routing and updates `Thread`, the engine delivers a `StepSnapshot[S]` containing the step index, node name, execution duration (`Duration`), and full `Thread`:
+```go
+engine := GopherGraph.NewEngine(cg).
+    WithSnapshotSaver(func(ctx context.Context, snap GopherGraph.StepSnapshot[MyState]) error {
+        stateJSON, err := snap.ThreadJSON() // Marshal Thread to compact JSON
+        if err != nil {
+            return err
+        }
+
+        // Persist node execution metadata & snapshot to your own DB (returning an error halts the workflow)
+        return saveToMyDB(ctx, WorkflowRecord{
+            Step:       snap.Step,
+            Node:       snap.Node,
+            DurationMs: snap.Duration.Milliseconds(),
+            NextNode:   snap.Thread.NextNode,
+            IsPaused:   snap.Thread.IsPaused,
+            IsFinished: snap.Thread.IsFinished,
+            ThreadJSON: stateJSON,
+        })
+    })
+```
+
+> 💡 Persistence timing is explicitly controlled by your application: save only when `thread.IsPaused` via `Checkpointer.Save` for zero runtime I/O overhead, or use `Engine.WithSnapshotSaver` to persist every step into your own database once routing and thread flags are finalized.
 
 #### 6. Conditional Target Validation & Mermaid Flowchart Export
 Declare reachable destinations for a conditional router with `AddConditionalEdgesWithTargets` (include `""` if the router can terminate the workflow). Targets are validated during `Compile()` and rendered into a complete Mermaid flowchart:
@@ -456,7 +502,7 @@ go test -v -race ./...
 - **ノードの自動リトライ（指数バックオフ）:** `Engine.WithRetryPolicy`（全体）および `Engine.WithNodeRetryPolicy`（ノード個別）で最大試行回数、指数バックオフ、カスタム `RetryIf` フィルタを設定可能。`context.Canceled` / `context.DeadlineExceeded` 時は即座に中断し、`StateCloner` と組み合わせてリトライ間の状態分離を保証します。
 - **コンパイル時および実行時の構造検証:** `Compile()` 実行時に、ノード・辺の存在チェック、並行ターゲットノードへの Interrupt 設定禁止、同一ノードの出辺タイプ競合を厳密に検出します。さらに `AddConditionalEdgesWithTargets` により条件付き分岐のターゲットをコンパイル時に静的検証し、実行時の未宣言ノードへの遷移もブロックします。
 - **Mermaid フローチャート出力:** `CompiledGraph.Mermaid()` / `Engine.Mermaid()` により、決定論的（Deterministic）な `flowchart TD` 形式の図を出力できます。通常ノード、Interrupt ノード、条件付き分岐、並行ファンアウト・マージを視覚的に区別して描画します。
-- **ユーザー主導の明示的な状態永続化:** 抽象的な `Checkpointer[S]` インタフェースと、アトミック書き込み対応の `FileCheckpointer[S]`、およびマルチバージョン追記（Append-Only）・履歴復元に対応した純 Go 製 `SQLiteCheckpointer[S]` を内蔵し、`threadID` のパス・トラバーサル検証を備えています。永続化のタイミングはユーザー側で完全に制御可能（一時停止時のみ保存、または `WithPostNodeHook` でステップ毎に保存）で、暗黙的な I/O オーバーヘッドを強制しません。
+- **ユーザー主導の明示的な状態永続化:** 抽象的な `Checkpointer[S]` インタフェースと、アトミック書き込み対応の `FileCheckpointer[S]`、およびマルチバージョン追記（Append-Only）・履歴復元に対応した純 Go 製 `SQLiteCheckpointer[S]` を内蔵し、`threadID` のパス・トラバーサル検証を備えています。さらに `Engine.WithSnapshotSaver` コールバックにより、各ステップ終了時に `Step`・`Node`・`Duration`（実行時間）・完全な `Thread`・`ThreadJSON()` を含む `StepSnapshot[S]` を受け取り、独自の MySQL / PostgreSQL / Redis などへ直接保存できます（暗黙的な I/O オーバーヘッドを強制しません）。
 - **ピュア Go & 高性能（CGO 不要）:** エンジンコアは Go 純正の Goroutines / Channels によるメモリ内処理で高速に動作し、内蔵永続化（SQLite を含む）も CGO 依存ゼロのピュア Go で実装されています。
 
 ### クイックスタート
@@ -613,7 +659,30 @@ versions, _ := sc.ListVersions(ctx, sessionID)
 sc.PruneVersions(ctx, sessionID, 5)
 ```
 
-> 💡 永続化のタイミングはアプリケーション側で明示的に制御できます：`thread.IsPaused` 時のみ保存して実行時 I/O オーバーヘッドをゼロに保つことも、`Engine.WithPostNodeHook` 内で `Save` を呼び出してステップ毎に自動保存することも可能です。
+##### C. カスタム DB コールバック (Engine.WithSnapshotSaver)
+ノードの実行情報やスナップショットを独自の業務データベース（MySQL、PostgreSQL、Redis など）へ直接保存したい場合は、`Engine.WithSnapshotSaver` でコールバックを登録できます。各ステップのルーティング計算と `Thread` 状態更新の完了後、ステップ番号・ノード名・実行時間（`Duration`）・完全な `Thread` を含む `StepSnapshot[S]` が渡されます：
+```go
+engine := GopherGraph.NewEngine(cg).
+    WithSnapshotSaver(func(ctx context.Context, snap GopherGraph.StepSnapshot[MyState]) error {
+        stateJSON, err := snap.ThreadJSON() // Thread をコンパクト JSON へ一括シリアライズ
+        if err != nil {
+            return err
+        }
+
+        // ノード実行情報とスナップショットを独自 DB へ保存（error を返すと即座に停止）
+        return saveToMyDB(ctx, WorkflowRecord{
+            Step:       snap.Step,
+            Node:       snap.Node,
+            DurationMs: snap.Duration.Milliseconds(),
+            NextNode:   snap.Thread.NextNode,
+            IsPaused:   snap.Thread.IsPaused,
+            IsFinished: snap.Thread.IsFinished,
+            ThreadJSON: stateJSON,
+        })
+    })
+```
+
+> 💡 永続化のタイミングはアプリケーション側で明示的に制御できます：`thread.IsPaused` 時のみ `Checkpointer.Save` を呼んで実行時 I/O オーバーヘッドをゼロに保つことも、`Engine.WithSnapshotSaver` でステップ確定後に独自データベースへ自動保存することも可能です。
 
 #### 6. 条件付きターゲット検証と Mermaid フローチャート出力
 `AddConditionalEdgesWithTargets` で条件ルーターが遷移し得るターゲットノードを宣言しておくことで（ワークフロー終了を含む場合は `""` を指定）、`Compile()` 時の存在検証と完全な Mermaid フローチャート出力が可能になります：

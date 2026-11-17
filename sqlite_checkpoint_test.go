@@ -291,11 +291,11 @@ func TestSQLiteCheckpointerConcurrency(t *testing.T) {
 	numRoutines := 10
 	savesPerRoutine := 5
 
-	for i := 0; i < numRoutines; i++ {
+	for i := range numRoutines {
 		wg.Add(1)
 		go func(routineID int) {
 			defer wg.Done()
-			for j := 0; j < savesPerRoutine; j++ {
+			for j := range savesPerRoutine {
 				tState := &Thread[SQLiteTestState]{
 					State:    SQLiteTestState{Count: routineID*100 + j},
 					NextNode: "step",

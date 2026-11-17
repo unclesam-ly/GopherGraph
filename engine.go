@@ -194,6 +194,9 @@ func (cg *CompiledGraph[S]) start(ctx context.Context, startNode string, initial
 	// 若起始节点本身被标记为中断点，则在执行该节点前直接挂起
 	if cg.interrupts[startNode] {
 		thread.IsPaused = true
+		if err := cg.saveSnapshot(ctx, 0, "", 0, thread, opts); err != nil {
+			return thread, err
+		}
 		return thread, nil
 	}
 
@@ -215,13 +218,42 @@ func (cg *CompiledGraph[S]) Resume(ctx context.Context, thread *Thread[S], modif
 
 // runOptions 封装引擎运行时的可选参数，由 Engine 包装器传入
 type runOptions[S any] struct {
-	maxSteps     int
-	stateCloner  func(S) S
-	preNodeHook  HookFn[S]
-	postNodeHook HookFn[S]
-	errorHook    ErrorHookFn[S]
-	retryPolicy  RetryPolicy
-	nodeRetries  map[string]RetryPolicy
+	maxSteps      int
+	stateCloner   func(S) S
+	preNodeHook   HookFn[S]
+	postNodeHook  HookFn[S]
+	errorHook     ErrorHookFn[S]
+	retryPolicy   RetryPolicy
+	nodeRetries   map[string]RetryPolicy
+	snapshotSaver SnapshotSaveFn[S]
+}
+
+// saveSnapshot 在配置了 snapshotSaver 时组装 StepSnapshot 并回调用户保存函数。
+func (cg *CompiledGraph[S]) saveSnapshot(
+	ctx context.Context,
+	step int,
+	nodeName string,
+	duration time.Duration,
+	thread *Thread[S],
+	opts runOptions[S],
+) error {
+	if opts.snapshotSaver == nil {
+		return nil
+	}
+	snapThread := *thread
+	if opts.stateCloner != nil {
+		snapThread.State = opts.stateCloner(thread.State)
+	}
+	snap := StepSnapshot[S]{
+		Step:     step,
+		Node:     nodeName,
+		Duration: duration,
+		Thread:   snapThread,
+	}
+	if err := opts.snapshotSaver(ctx, snap); err != nil {
+		return fmt.Errorf("snapshot saver error at node %q: %w", nodeName, err)
+	}
+	return nil
 }
 
 // resolveRetryPolicy 获取指定节点的生效重试策略（优先使用节点级策略，否则回退到全局策略）。
@@ -316,7 +348,7 @@ func (cg *CompiledGraph[S]) executeNode(
 	return state, lastErr
 }
 
-// run 是引擎内部循环调度器，负责驱动节点向前流转
+// / run 是引擎内部循环调度器，负责驱动节点向前流转
 func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts runOptions[S]) (*Thread[S], error) {
 	stepCount := 0
 
@@ -336,21 +368,21 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 		}
 
 		// 【熔断 1】检查步数上限，防御死循环（infinite loop protection）
-		if opts.maxSteps > 0 {
-			if stepCount >= opts.maxSteps {
-				return thread, fmt.Errorf(
-					"engine halt: max steps (%d) exceeded, possible infinite loop in graph",
-					opts.maxSteps,
-				)
-			}
-			stepCount++
+		if opts.maxSteps > 0 && stepCount >= opts.maxSteps {
+			return thread, fmt.Errorf(
+				"engine halt: max steps (%d) exceeded, possible infinite loop in graph",
+				opts.maxSteps,
+			)
 		}
+		stepCount++
 
 		// 查找当前节点
 		nodeFn, exists := cg.nodes[currentNodeName]
 		if !exists {
 			return thread, fmt.Errorf("runtime error: node %q not found", currentNodeName)
 		}
+
+		stepStart := time.Now()
 
 		// 执行当前节点（内部已包含 PreNodeHook、自动重试、PostNodeHook / ErrorHook）
 		newState, err := cg.executeNode(ctx, currentNodeName, nodeFn, thread.State, opts)
@@ -399,13 +431,24 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 			nextNode = cg.edges[currentNodeName]
 		}
 
-		// 更新快照中的"下一个节点"
-		thread.NextNode = nextNode
+		stepDuration := time.Since(stepStart)
 
-		// 核心中断机制：如果即将进入的下一个节点被标记为了中断节点，则在此挂起
-		if cg.interrupts[nextNode] {
+		// 更新快照中的"下一个节点"以及暂停/完结标记
+		thread.NextNode = nextNode
+		if nextNode == "" {
+			thread.IsFinished = true
+		} else if cg.interrupts[nextNode] {
 			thread.IsPaused = true
-			return thread, nil // 暂停执行，返回当前快照供外部人工介入
+		}
+
+		// 若用户注册了 SnapshotSaver，将本步完整的节点信息、耗时与最新 Thread 快照交给用户保存
+		if err := cg.saveSnapshot(ctx, stepCount, currentNodeName, stepDuration, thread, opts); err != nil {
+			return thread, err
+		}
+
+		// 若已到达终点或触发中断挂起，则退出循环返回当前快照
+		if thread.IsFinished || thread.IsPaused {
+			return thread, nil
 		}
 	}
 }

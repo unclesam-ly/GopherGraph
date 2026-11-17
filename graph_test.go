@@ -977,3 +977,74 @@ func TestRetryPolicyAndErrorHook(t *testing.T) {
 		t.Errorf("期望 ErrorHook 触发 1 次且记录 fatal 错误，实际次数=%d, err=%v", errHookCalled, lastHookErr)
 	}
 }
+
+// TestSnapshotSaver 验证 WithSnapshotSaver 回调能收到完整的节点名、耗时、NextNode、IsPaused 和 IsFinished 信息
+func TestSnapshotSaver(t *testing.T) {
+	g := NewGraph[TestState]()
+	g.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) {
+		time.Sleep(10 * time.Millisecond)
+		s.Value += 10
+		return s, nil
+	})
+	g.AddNode("B", func(ctx context.Context, s TestState) (TestState, error) {
+		time.Sleep(10 * time.Millisecond)
+		s.Value += 20
+		return s, nil
+	})
+	g.AddEdge("A", "B")
+	g.AddInterrupt("B")
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+
+	var snapshots []StepSnapshot[TestState]
+	engine := NewEngine(cg).WithSnapshotSaver(func(ctx context.Context, snap StepSnapshot[TestState]) error {
+		snapshots = append(snapshots, snap)
+		return nil
+	})
+
+	// 1. Start 执行完 A，在 B 之前挂起
+	thread, err := engine.Start(context.Background(), "A", TestState{Value: 1})
+	if err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("期望 Start 后产生 1 条快照，实际 %d 条", len(snapshots))
+	}
+	s1 := snapshots[0]
+	if s1.Step != 1 || s1.Node != "A" || s1.Duration < 5*time.Millisecond {
+		t.Errorf("快照 1 元数据不符: step=%d, node=%q, duration=%v", s1.Step, s1.Node, s1.Duration)
+	}
+	if !s1.Thread.IsPaused || s1.Thread.IsFinished || s1.Thread.NextNode != "B" || s1.Thread.State.Value != 11 {
+		t.Errorf("快照 1 Thread 状态不符: %+v", s1.Thread)
+	}
+	if jsonStr, err := s1.ThreadJSON(); err != nil || !strings.Contains(jsonStr, `"NextNode":"B"`) {
+		t.Errorf("ThreadJSON 序列化异常: err=%v, json=%s", err, jsonStr)
+	}
+
+	// 2. Resume 执行完 B 并到达终点
+	_, err = engine.Resume(context.Background(), thread, thread.State)
+	if err != nil {
+		t.Fatalf("Resume 失败: %v", err)
+	}
+	if len(snapshots) != 2 {
+		t.Fatalf("期望 Resume 后总计 2 条快照，实际 %d 条", len(snapshots))
+	}
+	s2 := snapshots[1]
+	if s2.Step != 1 || s2.Node != "B" || s2.Duration < 5*time.Millisecond {
+		t.Errorf("快照 2 元数据不符: step=%d, node=%q, duration=%v", s2.Step, s2.Node, s2.Duration)
+	}
+	if s2.Thread.IsPaused || !s2.Thread.IsFinished || s2.Thread.NextNode != "" || s2.Thread.State.Value != 31 {
+		t.Errorf("快照 2 Thread 状态不符: %+v", s2.Thread)
+	}
+
+	// 3. 验证当用户的 SnapshotSaver 返回错误时，引擎立即中止并向上返回该错误
+	errEngine := NewEngine(cg).WithSnapshotSaver(func(ctx context.Context, snap StepSnapshot[TestState]) error {
+		return errors.New("custom db write error")
+	})
+	if _, err := errEngine.Start(context.Background(), "A", TestState{}); err == nil || !strings.Contains(err.Error(), "custom db write error") {
+		t.Fatalf("期望返回 custom db write error，实际: %v", err)
+	}
+}
