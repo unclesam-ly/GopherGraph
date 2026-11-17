@@ -838,3 +838,76 @@ func TestStartNodeInterruptAndValidation(t *testing.T) {
 		t.Fatalf("期望 Resume 后完成且 Value=11，实际: %+v", thread)
 	}
 }
+
+// TestConditionalEdgesWithTargetsAndMermaid 验证带目标声明的条件边校验与 Mermaid 流程图导出
+func TestConditionalEdgesWithTargetsAndMermaid(t *testing.T) {
+	noop := func(ctx context.Context, s TestState) (TestState, error) { return s, nil }
+
+	// 1. 编译期校验：声明了不存在的目标节点应报错
+	gInvalid := NewGraph[TestState]()
+	gInvalid.AddNode("start", noop)
+	gInvalid.AddConditionalEdgesWithTargets("start", []string{"ghost"}, func(ctx context.Context, s TestState) (string, error) {
+		return "ghost", nil
+	})
+	if _, err := gInvalid.Compile(); err == nil || !strings.Contains(err.Error(), "conditional edge target") {
+		t.Fatalf("期望编译期报错 conditional edge target，实际: %v", err)
+	}
+
+	// 2. 运行时校验：router 返回了未在 targets 中声明的节点应报错
+	gUndeclared := NewGraph[TestState]()
+	gUndeclared.AddNode("start", noop)
+	gUndeclared.AddNode("A", noop)
+	gUndeclared.AddNode("B", noop)
+	gUndeclared.AddConditionalEdgesWithTargets("start", []string{"A"}, func(ctx context.Context, s TestState) (string, error) {
+		return "B", nil // B 存在，但未在 targets 列表中声明
+	})
+	cgUndeclared, err := gUndeclared.Compile()
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	if _, err := cgUndeclared.Start(context.Background(), "start", TestState{}); err == nil || !strings.Contains(err.Error(), "undeclared target") {
+		t.Fatalf("期望运行时报 undeclared target 错误，实际: %v", err)
+	}
+
+	// 3. Mermaid 导出完整性验证（含静态边、条件边、并发边、中断节点、保留字节点 "end"）
+	g := NewGraph[TestState]()
+	g.AddNode("start", noop)
+	g.AddNode("reviewer", noop)
+	g.AddNode("human_review", noop)
+	g.AddNode("task1", noop)
+	g.AddNode("task2", noop)
+	g.AddNode("end", noop)
+
+	g.AddEdge("start", "reviewer")
+	g.AddConditionalEdgesWithTargets("reviewer", []string{"human_review", "task1", ""}, func(ctx context.Context, s TestState) (string, error) {
+		return "task1", nil
+	})
+	g.AddParallelEdges("human_review", []string{"task1", "task2"}, "end", func(ctx context.Context, p TestState, b []TestState) (TestState, error) {
+		return p, nil
+	})
+	g.AddInterrupt("human_review")
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+
+	mermaid := NewEngine(cg).Mermaid()
+	expectedSnippets := []string{
+		"flowchart TD",
+		`human_review(["⏸ human_review (Interrupt)"])`,
+		`node_end["end"]`, // 保留字 end 自动转义为 node_end
+		"start --> reviewer",
+		"reviewer -.->|conditional| human_review",
+		"reviewer -.->|conditional| task1",
+		`reviewer -.->|conditional| __END__(["🏁 END"])`,
+		"human_review ==>|parallel| task1",
+		"task1 ==>|merge| node_end",
+		"style human_review",
+	}
+	for _, snippet := range expectedSnippets {
+		if !strings.Contains(mermaid, snippet) {
+			t.Errorf("Mermaid 输出缺少期望片段 %q\n完整输出:\n%s", snippet, mermaid)
+		}
+	}
+}

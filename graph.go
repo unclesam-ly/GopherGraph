@@ -26,22 +26,24 @@ type parallelStep[S any] struct {
 
 // Graph 是图的构建器，S 代表用户自定义的状态结构体。
 type Graph[S any] struct {
-	nodes       map[string]NodeFn[S]       // 节点名称 -> 节点执行函数
-	edges       map[string]string          // 普通单向边：源节点 -> 目标节点
-	conditional map[string]RouterFn[S]     // 条件路由边：源节点 -> 路由函数
-	interrupts  map[string]bool            // 标记需要中断的节点：执行完该节点后挂起
-	parallels   map[string]parallelStep[S] // 并发分支：源节点 -> 并发步骤配置
-	errs        []error                    // 注册阶段的错误积累（重复注册等），在 Compile 时统一报告
+	nodes              map[string]NodeFn[S]       // 节点名称 -> 节点执行函数
+	edges              map[string]string          // 普通单向边：源节点 -> 目标节点
+	conditional        map[string]RouterFn[S]     // 条件路由边：源节点 -> 路由函数
+	conditionalTargets map[string][]string        // 条件路由声明的可达目标节点列表（可选，用于编译校验与 Mermaid 导出）
+	interrupts         map[string]bool            // 标记需要中断的节点：执行完该节点后挂起
+	parallels          map[string]parallelStep[S] // 并发分支：源节点 -> 并发步骤配置
+	errs               []error                    // 注册阶段的错误积累（重复注册等），在 Compile 时统一报告
 }
 
 // NewGraph 创建并初始化一个全新强类型的图构建器
 func NewGraph[S any]() *Graph[S] {
 	return &Graph[S]{
-		nodes:       make(map[string]NodeFn[S]),
-		edges:       make(map[string]string),
-		conditional: make(map[string]RouterFn[S]),
-		interrupts:  make(map[string]bool),
-		parallels:   make(map[string]parallelStep[S]),
+		nodes:              make(map[string]NodeFn[S]),
+		edges:              make(map[string]string),
+		conditional:        make(map[string]RouterFn[S]),
+		conditionalTargets: make(map[string][]string),
+		interrupts:         make(map[string]bool),
+		parallels:          make(map[string]parallelStep[S]),
 	}
 }
 
@@ -86,6 +88,26 @@ func (g *Graph[S]) AddConditionalEdges(from string, router RouterFn[S]) {
 		return
 	}
 	g.conditional[from] = router
+}
+
+// AddConditionalEdgesWithTargets 建立一条带可达目标节点列表声明的条件路由。
+// targets 声明 router 可能返回的所有目标节点名称（若允许路由直接结束工作流，可包含 ""），用于：
+//  1. Compile() 编译期静态校验所有目标节点是否存在；
+//  2. 运行时校验 router 返回的节点是否超出声明范围；
+//  3. Mermaid() 导出时完整绘制条件分支连线。
+func (g *Graph[S]) AddConditionalEdgesWithTargets(from string, targets []string, router RouterFn[S]) {
+	if len(targets) == 0 {
+		g.errs = append(g.errs, fmt.Errorf("AddConditionalEdgesWithTargets: node %q must specify at least one target", from))
+		return
+	}
+	if _, exists := g.conditional[from]; exists {
+		g.errs = append(g.errs, fmt.Errorf("AddConditionalEdges: node %q already has a conditional edge registered", from))
+		return
+	}
+	g.AddConditionalEdges(from, router)
+	if router != nil {
+		g.conditionalTargets[from] = append([]string(nil), targets...)
+	}
 }
 
 // AddInterrupt 标记在执行 nodeName 节点"之前"进行中断挂起，等待人工确认。

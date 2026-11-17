@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 )
 
@@ -18,11 +19,12 @@ type Thread[S any] struct {
 
 // CompiledGraph 是编译后的只读图，准备好投入运行。
 type CompiledGraph[S any] struct {
-	nodes       map[string]NodeFn[S]
-	edges       map[string]string
-	conditional map[string]RouterFn[S]
-	interrupts  map[string]bool
-	parallels   map[string]parallelStep[S]
+	nodes              map[string]NodeFn[S]
+	edges              map[string]string
+	conditional        map[string]RouterFn[S]
+	conditionalTargets map[string][]string
+	interrupts         map[string]bool
+	parallels          map[string]parallelStep[S]
 }
 
 // Compile 校验图结构的合法性，并生成可运行的 CompiledGraph。
@@ -50,6 +52,17 @@ func (g *Graph[S]) Compile() (*CompiledGraph[S], error) {
 	for from := range g.conditional {
 		if _, exists := g.nodes[from]; !exists {
 			return nil, fmt.Errorf("compile error: conditional edge origin %q does not exist", from)
+		}
+	}
+
+	// 校验声明了目标列表的条件路由边，确保所有非空目标节点均存在
+	for from, targets := range g.conditionalTargets {
+		for _, target := range targets {
+			if target != "" {
+				if _, exists := g.nodes[target]; !exists {
+					return nil, fmt.Errorf("compile error: conditional edge target %q from %q does not exist", target, from)
+				}
+			}
 		}
 	}
 
@@ -125,13 +138,18 @@ func (g *Graph[S]) Compile() (*CompiledGraph[S], error) {
 	for k, v := range g.parallels {
 		parallelsCopy[k] = v
 	}
+	conditionalTargetsCopy := make(map[string][]string, len(g.conditionalTargets))
+	for k, v := range g.conditionalTargets {
+		conditionalTargetsCopy[k] = append([]string(nil), v...)
+	}
 
 	return &CompiledGraph[S]{
-		nodes:       nodesCopy,
-		edges:       edgesCopy,
-		conditional: conditionalCopy,
-		interrupts:  interruptsCopy,
-		parallels:   parallelsCopy,
+		nodes:              nodesCopy,
+		edges:              edgesCopy,
+		conditional:        conditionalCopy,
+		conditionalTargets: conditionalTargetsCopy,
+		interrupts:         interruptsCopy,
+		parallels:          parallelsCopy,
 	}, nil
 }
 
@@ -281,6 +299,12 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 			if next != "" {
 				if _, exists := cg.nodes[next]; !exists {
 					return thread, fmt.Errorf("router for node %q returned non-existent node %q (not found)", currentNodeName, next)
+				}
+			}
+			// 若注册时通过 AddConditionalEdgesWithTargets 声明了允许的目标范围，则校验是否越界
+			if allowed, hasTargets := cg.conditionalTargets[currentNodeName]; hasTargets {
+				if !slices.Contains(allowed, next) {
+					return thread, fmt.Errorf("router for node %q returned undeclared target %q (allowed: %v)", currentNodeName, next, allowed)
 				}
 			}
 			nextNode = next
