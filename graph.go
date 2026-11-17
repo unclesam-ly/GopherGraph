@@ -46,8 +46,16 @@ func NewGraph[S any]() *Graph[S] {
 }
 
 // AddNode 向图中注册一个节点（Agent）。
-// 若同名节点已被注册，不会覆盖原有节点，错误将在 Compile() 时统一报告。
+// 若节点名为空、函数为 nil，或同名节点已被注册，不会覆盖原有节点，错误将在 Compile() 时统一报告。
 func (g *Graph[S]) AddNode(name string, fn NodeFn[S]) {
+	if name == "" {
+		g.errs = append(g.errs, errors.New("AddNode: node name must not be empty"))
+		return
+	}
+	if fn == nil {
+		g.errs = append(g.errs, fmt.Errorf("AddNode: node %q has nil NodeFn", name))
+		return
+	}
 	if _, exists := g.nodes[name]; exists {
 		g.errs = append(g.errs, fmt.Errorf("AddNode: node %q is already registered", name))
 		return
@@ -69,6 +77,10 @@ func (g *Graph[S]) AddEdge(from, to string) {
 // 到底去哪，由 router 函数在运行时根据当前 State 动态决定。
 // 若 from 节点已有条件出边，不会覆盖，错误将在 Compile() 时统一报告。
 func (g *Graph[S]) AddConditionalEdges(from string, router RouterFn[S]) {
+	if router == nil {
+		g.errs = append(g.errs, fmt.Errorf("AddConditionalEdges: node %q has nil router", from))
+		return
+	}
 	if _, exists := g.conditional[from]; exists {
 		g.errs = append(g.errs, fmt.Errorf("AddConditionalEdges: node %q already has a conditional edge registered", from))
 		return

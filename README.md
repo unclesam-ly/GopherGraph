@@ -15,7 +15,12 @@ Go 言語（ジェネリクス）で書かれた、軽量・高性能・型安�
 ## 🇨🇳 简体中文
 
 ### 简介
+
+> **Q: GopherGraph 好用吗？**
+> **A: 就像你问你女朋友爱不爱你一样——至少编译器不会欺骗你。**
+
 `GopherGraph` 是一个用 Go 语言编写的代码即图（Code-as-Graph）智能体编排引擎，设计灵感来源于 Python 生态的 `LangGraph`。它利用 Go 1.18+ 的泛型机制，让工作流的上下文状态在编译期就具备强类型约束，并依靠 Go 原生的 Goroutines 和 Channels 实现极高并发的本地数据流转。它特别适合构建包含复杂循环（Looping）、并发节点执行（Parallel Execution）和人机协同（Human-in-the-Loop）的智能体工作流。
+
 
 ### 核心特性
 - **强类型状态管理：** 利用 Go 泛型定义全局状态 `Graph[S]`，彻底告别松散的 `map[string]any` 和繁琐的类型断言。
@@ -187,7 +192,12 @@ go test -v -race ./...
 ## 🇺🇸 English
 
 ### Introduction
+
+> **Q: Is GopherGraph reliable?**
+> **A:** Like asking your girlfriend if she loves you — at least the compiler won't lie to you.
+
 `GopherGraph` is a Code-as-Graph agent orchestration engine built in Go, inspired by Python's `LangGraph`. By leveraging Go 1.18+ Generics, GopherGraph ensures that workflow states are strictly typed at compile-time. Powered by native Goroutines and Channels, it executes agent communication with microsecond latency, making it the perfect engine for building complex looping agent workflows with Human-in-the-Loop (HITL), concurrent branches, and state persistence requirements.
+
 
 ### Key Features
 - **Strictly Typed State:** Bind your custom struct to `Graph[S]` via Go generics. Say goodbye to unsafe `map[string]any` and runtime type assertions.
@@ -358,7 +368,12 @@ go test -v -race ./...
 ## 🇯🇵 日本語
 
 ### 概要
+
+> **Q: GopherGraph は使いやすいですか？**
+> **A:** 彼女に「私のことが好き？」と聞くのと同じです——少なくともコンパイラは嘘をつきません。
+
 `GopherGraph` は、Python エコシステムの `LangGraph` に着想を得て開発された、Go 言語向けの Code-as-Graph 型エージェントオーケストレーションエンジンです。Go 1.18+ のジェネリクスを活用することで、ワークフローの状態（State）をコンパイル時に厳密に型定義できます。Go 純正の Goroutines と Channels を利用したメモリ内メッセージングにより、高い並行性と極めて低いレイテンシを実現しています。自律的なループ（Looping）や、並行処理（Parallel Execution）、人間参加型（Human-in-the-Loop）の意思決定を伴うエージェントワークフローの開発に最適です。
+
 
 ### 主な特徴
 - **型安全な状態管理:** ジェネリクスを用いて `Graph[S]` に構造体をバインドします。冗長な `map[string]any` やランタイム時の型アサーションから解放されます。

@@ -66,9 +66,12 @@ func main() {
 	g.AddEdge("drafter", "reviewer")
 	g.AddParallelEdges("reviewer", []string{"translate_en", "translate_ja"}, "publisher",
 		func(ctx context.Context, parent AgentState, branches []AgentState) (AgentState, error) {
-			// 合并所有分支的 Messages
+			// 只合并各个并发分支在 parent 基础上【新增】的 Messages
+			baseLen := len(parent.Messages)
 			for _, b := range branches {
-				parent.Messages = append(parent.Messages, b.Messages...)
+				if len(b.Messages) > baseLen {
+					parent.Messages = append(parent.Messages, b.Messages[baseLen:]...)
+				}
 			}
 			parent.Messages = append(parent.Messages, "merger: 翻译分支已合并")
 			return parent, nil

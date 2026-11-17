@@ -73,6 +73,9 @@ func (g *Graph[S]) Compile() (*CompiledGraph[S], error) {
 			if _, exists := g.nodes[target]; !exists {
 				return nil, fmt.Errorf("compile error: parallel target %q from %q does not exist", target, from)
 			}
+			if g.interrupts[target] {
+				return nil, fmt.Errorf("compile error: parallel target %q from %q cannot be marked as an interrupt node", target, from)
+			}
 		}
 		if step.next != "" {
 			if _, exists := g.nodes[step.next]; !exists {
@@ -152,12 +155,30 @@ func validateResume[S any](thread *Thread[S]) error {
 
 // Start 从指定的起始节点开始运行图，并持续流转，直到遇到中断或运行结束
 func (cg *CompiledGraph[S]) Start(ctx context.Context, startNode string, initialState S) (*Thread[S], error) {
+	return cg.start(ctx, startNode, initialState, runOptions[S]{})
+}
+
+// start 校验起始节点并处理首节点中断，随后进入主循环调度器
+func (cg *CompiledGraph[S]) start(ctx context.Context, startNode string, initialState S, opts runOptions[S]) (*Thread[S], error) {
+	if startNode == "" {
+		return nil, errors.New("start error: startNode must not be empty")
+	}
+	if _, exists := cg.nodes[startNode]; !exists {
+		return nil, fmt.Errorf("start error: startNode %q not found", startNode)
+	}
+
 	thread := &Thread[S]{
 		State:    initialState,
 		NextNode: startNode,
 	}
 
-	return cg.run(ctx, thread, runOptions[S]{})
+	// 若起始节点本身被标记为中断点，则在执行该节点前直接挂起
+	if cg.interrupts[startNode] {
+		thread.IsPaused = true
+		return thread, nil
+	}
+
+	return cg.run(ctx, thread, opts)
 }
 
 // Resume 恢复执行一个被暂停的线程，并允许注入外部修改后的状态数据（例如人工审批修改后的结果）
@@ -238,7 +259,7 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 		var nextNode string
 		if step, isParallel := cg.parallels[currentNodeName]; isParallel {
 			// 【处理并发分流】使用短路取消机制
-			branches, err := cg.runParallelBranches(ctx, step.targets, thread.State, opts.stateCloner)
+			branches, err := cg.runParallelBranches(ctx, step.targets, thread.State, opts)
 			if err != nil {
 				return thread, fmt.Errorf("parallel branch execution error: %w", err)
 			}
@@ -289,7 +310,7 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 	ctx context.Context,
 	targets []string,
 	state S,
-	stateCloner func(S) S,
+	opts runOptions[S],
 ) ([]S, error) {
 	// 派生可取消的子 Context：任意分支出错时，立即广播取消信号
 	cancelCtx, cancel := context.WithCancel(ctx)
@@ -310,8 +331,8 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 
 		// 按需深拷贝状态：有 stateCloner 则深拷贝，否则值拷贝（Go 默认语义）
 		var stateCopy S
-		if stateCloner != nil {
-			stateCopy = stateCloner(state)
+		if opts.stateCloner != nil {
+			stateCopy = opts.stateCloner(state)
 		} else {
 			stateCopy = state
 		}
@@ -327,6 +348,11 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 			default:
 			}
 
+			// 触发并发子节点的 PreNodeHook
+			if opts.preNodeHook != nil {
+				opts.preNodeHook(cancelCtx, nodeName, s)
+			}
+
 			nodeFn := cg.nodes[nodeName]
 			resState, err := nodeFn(cancelCtx, s)
 			if err != nil {
@@ -334,6 +360,12 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 				resultCh <- result{idx: idx, err: err}
 				return
 			}
+
+			// 触发并发子节点的 PostNodeHook
+			if opts.postNodeHook != nil {
+				opts.postNodeHook(cancelCtx, nodeName, resState)
+			}
+
 			resultCh <- result{idx: idx, state: resState}
 		}(i, target, stateCopy)
 	}
@@ -349,8 +381,12 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 	// 解决方案：等全部结果到齐后，再过滤出第一个非取消的真实错误。
 	branches := make([]S, len(targets))
 	var firstErr error
+	var anyErr error
 	for r := range resultCh {
 		if r.err != nil {
+			if anyErr == nil {
+				anyErr = r.err
+			}
 			// 过滤掉因取消产生的次生错误，只记录第一个真实错误
 			if !errors.Is(r.err, context.Canceled) && firstErr == nil {
 				firstErr = r.err
@@ -361,6 +397,10 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 	}
 	if firstErr != nil {
 		return nil, firstErr
+	}
+	// 若所有分支报错均为 context.Canceled（例如外部父 Context 被主动取消），不能吞掉错误
+	if anyErr != nil {
+		return nil, anyErr
 	}
 
 	return branches, nil

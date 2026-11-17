@@ -145,11 +145,7 @@ func (e *Engine[S]) opts() runOptions[S] {
 // Start 从指定节点启动工作流，行为与 CompiledGraph.Start 完全一致，
 // 但会附加所有已注册的 Engine 增强选项（Hooks、MaxSteps、StateCloner）。
 func (e *Engine[S]) Start(ctx context.Context, startNode string, initialState S) (*Thread[S], error) {
-	thread := &Thread[S]{
-		State:    initialState,
-		NextNode: startNode,
-	}
-	return e.graph.run(ctx, thread, e.opts())
+	return e.graph.start(ctx, startNode, initialState, e.opts())
 }
 
 // Resume 恢复执行一个被暂停的线程，行为与 CompiledGraph.Resume 完全一致，

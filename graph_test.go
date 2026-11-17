@@ -544,9 +544,13 @@ func TestCompileValidationErrors(t *testing.T) {
 	g4.AddEdge("A", "C") // 重复静态边
 	g4.AddConditionalEdges("A", func(ctx context.Context, s TestState) (string, error) { return "B", nil })
 	g4.AddConditionalEdges("A", func(ctx context.Context, s TestState) (string, error) { return "C", nil }) // 重复条件边
-	g4.AddParallelEdges("A", []string{"B"}, "", func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) { return parent, nil })
-	g4.AddParallelEdges("A", []string{"C"}, "", func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) { return parent, nil }) // 重复并发边
-	
+	g4.AddParallelEdges("A", []string{"B"}, "", func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) {
+		return parent, nil
+	})
+	g4.AddParallelEdges("A", []string{"C"}, "", func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) {
+		return parent, nil
+	}) // 重复并发边
+
 	_, err = g4.Compile()
 	if err == nil {
 		t.Fatal("重复注册应报错")
@@ -756,5 +760,81 @@ func TestFileCheckpointerCompactJSON(t *testing.T) {
 	dataPretty, _ := os.ReadFile(tmpDir + "/pretty.json")
 	if !strings.Contains(string(dataPretty), "\n") {
 		t.Error("WithPrettyJSON 模式应包含换行符")
+	}
+}
+
+// TestParallelExternalContextCancel 验证外部主动取消父 Context 时，并发分支不会吞掉 context.Canceled
+func TestParallelExternalContextCancel(t *testing.T) {
+	g := NewGraph[TestState]()
+	g.AddNode("start", func(ctx context.Context, s TestState) (TestState, error) { return s, nil })
+	g.AddNode("b1", func(ctx context.Context, s TestState) (TestState, error) {
+		<-ctx.Done()
+		return s, ctx.Err()
+	})
+	g.AddNode("b2", func(ctx context.Context, s TestState) (TestState, error) {
+		<-ctx.Done()
+		return s, ctx.Err()
+	})
+	g.AddParallelEdges("start", []string{"b1", "b2"}, "", func(ctx context.Context, p TestState, b []TestState) (TestState, error) {
+		return p, nil
+	})
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = cg.Start(ctx, "start", TestState{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("期望返回 context.Canceled，实际返回: %v", err)
+	}
+}
+
+// TestStartNodeInterruptAndValidation 验证首节点中断与非法 startNode 校验
+func TestStartNodeInterruptAndValidation(t *testing.T) {
+	g := NewGraph[TestState]()
+	g.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Value += 10
+		return s, nil
+	})
+	g.AddInterrupt("A")
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+
+	// 1. 空 startNode 应报错
+	if _, err := cg.Start(context.Background(), "", TestState{}); err == nil {
+		t.Error("空 startNode 应返回错误")
+	}
+
+	// 2. 不存在的 startNode 应报错
+	if _, err := cg.Start(context.Background(), "ghost", TestState{}); err == nil {
+		t.Error("不存在的 startNode 应返回错误")
+	}
+
+	// 3. 首节点被标记为 Interrupt 时，Start 应在执行 A 之前暂停
+	thread, err := cg.Start(context.Background(), "A", TestState{Value: 1})
+	if err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	if !thread.IsPaused || thread.NextNode != "A" || thread.State.Value != 1 {
+		t.Fatalf("期望在 A 执行前暂停且 Value=1，实际: %+v", thread)
+	}
+
+	// 4. Resume 后应正常执行 A 并结束
+	thread, err = cg.Resume(context.Background(), thread, thread.State)
+	if err != nil {
+		t.Fatalf("Resume 失败: %v", err)
+	}
+	if !thread.IsFinished || thread.State.Value != 11 {
+		t.Fatalf("期望 Resume 后完成且 Value=11，实际: %+v", thread)
 	}
 }
