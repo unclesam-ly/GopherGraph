@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 )
 
 // Thread 代表图执行的具体实例快照（线程上下文）
@@ -218,6 +219,101 @@ type runOptions[S any] struct {
 	stateCloner  func(S) S
 	preNodeHook  HookFn[S]
 	postNodeHook HookFn[S]
+	errorHook    ErrorHookFn[S]
+	retryPolicy  RetryPolicy
+	nodeRetries  map[string]RetryPolicy
+}
+
+// resolveRetryPolicy 获取指定节点的生效重试策略（优先使用节点级策略，否则回退到全局策略）。
+func (opts runOptions[S]) resolveRetryPolicy(nodeName string) RetryPolicy {
+	if opts.nodeRetries != nil {
+		if p, ok := opts.nodeRetries[nodeName]; ok {
+			return p
+		}
+	}
+	return opts.retryPolicy
+}
+
+// executeNode 统一封装单个节点的生命周期：PreNodeHook -> 带重试策略执行 NodeFn -> PostNodeHook / ErrorHook。
+func (cg *CompiledGraph[S]) executeNode(
+	ctx context.Context,
+	nodeName string,
+	nodeFn NodeFn[S],
+	state S,
+	opts runOptions[S],
+) (S, error) {
+	if opts.preNodeHook != nil {
+		opts.preNodeHook(ctx, nodeName, state)
+	}
+	policy := opts.resolveRetryPolicy(nodeName)
+	maxAttempts := policy.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	multiplier := policy.Multiplier
+	if multiplier <= 0 {
+		multiplier = 2.0
+	}
+	backoff := policy.InitialBackoff
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			// 重试等待期间监听 Context 取消，支持外部超时或兄弟并发分支短路取消时立即唤醒退出
+			if backoff > 0 {
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					lastErr = ctx.Err()
+					if opts.errorHook != nil {
+						opts.errorHook(ctx, nodeName, state, lastErr)
+					}
+					return state, lastErr
+				case <-timer.C:
+				}
+				// 计算下一次指数退避时间
+				nextBackoff := time.Duration(float64(backoff) * multiplier)
+				if policy.MaxBackoff > 0 && nextBackoff > policy.MaxBackoff {
+					nextBackoff = policy.MaxBackoff
+				}
+				backoff = nextBackoff
+			} else if err := ctx.Err(); err != nil {
+				lastErr = err
+				if opts.errorHook != nil {
+					opts.errorHook(ctx, nodeName, state, lastErr)
+				}
+				return state, lastErr
+			}
+		}
+
+		// 若配置了深拷贝且需要多次尝试，每次尝试传入独立拷贝，防止失败尝试对引用类型的半途修改污染下一次重试
+		attemptState := state
+		if maxAttempts > 1 && opts.stateCloner != nil {
+			attemptState = opts.stateCloner(state)
+		}
+		resState, err := nodeFn(ctx, attemptState)
+		if err == nil {
+			if opts.postNodeHook != nil {
+				opts.postNodeHook(ctx, nodeName, resState)
+			}
+			return resState, nil
+		}
+		lastErr = err
+		// Context 取消或超时属于确定性终止信号，绝不重试
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			break
+		}
+		// 若用户定义了 RetryIf 过滤函数且返回 false，则不再重试
+		if policy.RetryIf != nil && !policy.RetryIf(err) {
+			break
+		}
+	}
+
+	if opts.errorHook != nil {
+		opts.errorHook(ctx, nodeName, state, lastErr)
+	}
+	return state, lastErr
 }
 
 // run 是引擎内部循环调度器，负责驱动节点向前流转
@@ -256,22 +352,12 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S], opts run
 			return thread, fmt.Errorf("runtime error: node %q not found", currentNodeName)
 		}
 
-		// 触发 PreNodeHook
-		if opts.preNodeHook != nil {
-			opts.preNodeHook(ctx, currentNodeName, thread.State)
-		}
-
-		// 执行当前节点
-		newState, err := nodeFn(ctx, thread.State)
+		// 执行当前节点（内部已包含 PreNodeHook、自动重试、PostNodeHook / ErrorHook）
+		newState, err := cg.executeNode(ctx, currentNodeName, nodeFn, thread.State, opts)
 		if err != nil {
 			return thread, fmt.Errorf("node %q execution error: %w", currentNodeName, err)
 		}
 		thread.State = newState
-
-		// 触发 PostNodeHook
-		if opts.postNodeHook != nil {
-			opts.postNodeHook(ctx, currentNodeName, thread.State)
-		}
 
 		// 计算下一个该执行的节点名称
 		var nextNode string
@@ -372,24 +458,13 @@ func (cg *CompiledGraph[S]) runParallelBranches(
 			default:
 			}
 
-			// 触发并发子节点的 PreNodeHook
-			if opts.preNodeHook != nil {
-				opts.preNodeHook(cancelCtx, nodeName, s)
-			}
-
 			nodeFn := cg.nodes[nodeName]
-			resState, err := nodeFn(cancelCtx, s)
+			resState, err := cg.executeNode(cancelCtx, nodeName, nodeFn, s, opts)
 			if err != nil {
 				cancel() // 关键：一处报错，立即取消其余所有兄弟 goroutine
 				resultCh <- result{idx: idx, err: err}
 				return
 			}
-
-			// 触发并发子节点的 PostNodeHook
-			if opts.postNodeHook != nil {
-				opts.postNodeHook(cancelCtx, nodeName, resState)
-			}
-
 			resultCh <- result{idx: idx, state: resState}
 		}(i, target, stateCopy)
 	}

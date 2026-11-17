@@ -139,6 +139,11 @@ func (g *Graph[S]) AddParallelEdges(from string, targets []string, next string, 
 // 可通过此钩子接入日志、链路追踪（OpenTelemetry）、监控指标等能力，而无需修改任何 NodeFn。
 type HookFn[S any] func(ctx context.Context, nodeName string, state S)
 
+// ErrorHookFn 是节点执行失败时的生命周期钩子函数签名。
+// 当节点执行返回非 nil 错误（若配置了重试，则在重试耗尽仍失败后）触发。
+// 典型用途：记录错误日志、关闭在 PreNodeHook 中开启的 OpenTelemetry Span、上报失败告警指标。
+type ErrorHookFn[S any] func(ctx context.Context, nodeName string, state S, err error)
+
 // errorsJoin 兼容多个错误合并为一个，避免 errors.Join 输出格式不够友好。
 // 仅供内部 graph.errs 汇总使用。
 func errorsJoin(errs []error) error {

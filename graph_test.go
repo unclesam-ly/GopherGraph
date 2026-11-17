@@ -911,3 +911,69 @@ func TestConditionalEdgesWithTargetsAndMermaid(t *testing.T) {
 		}
 	}
 }
+
+// TestRetryPolicyAndErrorHook 验证节点自动重试（含 RetryIf 过滤）与 ErrorHook 触发闭环
+func TestRetryPolicyAndErrorHook(t *testing.T) {
+	var attempts int
+	var errHookCalled int
+	var lastHookErr error
+
+	g := NewGraph[TestState]()
+	// flaky 节点：前 2 次失败，第 3 次成功，且每次向切片写入脏数据（测试重试隔离）
+	g.AddNode("flaky", func(ctx context.Context, s TestState) (TestState, error) {
+		attempts++
+		s.Log = append(s.Log, "attempt")
+		if attempts < 3 {
+			return s, errors.New("temporary 429 rate limit")
+		}
+		s.Value = 42
+		return s, nil
+	})
+	// fatal 节点：返回不可重试的错误
+	g.AddNode("fatal", func(ctx context.Context, s TestState) (TestState, error) {
+		return s, errors.New("permanent auth error")
+	})
+	g.AddEdge("flaky", "fatal")
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+
+	engine := NewEngine(cg).
+		WithStateCloner(func(s TestState) TestState {
+			clone := s
+			clone.Log = append([]string(nil), s.Log...)
+			return clone
+		}).
+		WithRetryPolicy(RetryPolicy{
+			MaxAttempts:    3,
+			InitialBackoff: 5 * time.Millisecond,
+			Multiplier:     2.0,
+			RetryIf: func(err error) bool {
+				return strings.Contains(err.Error(), "temporary")
+			},
+		}).
+		WithErrorHook(func(ctx context.Context, name string, s TestState, err error) {
+			errHookCalled++
+			lastHookErr = err
+		})
+
+	thread, err := engine.Start(context.Background(), "flaky", TestState{})
+	if err == nil || !strings.Contains(err.Error(), "permanent auth error") {
+		t.Fatalf("期望在 fatal 节点报错退出，实际: %v", err)
+	}
+
+	// flaky 应该重试了 3 次后成功，且 StateCloner 保证了前两次失败的 append 不会污染第 3 次成功的状态
+	if attempts != 3 {
+		t.Errorf("期望 flaky 尝试 3 次，实际 %d 次", attempts)
+	}
+	if thread.State.Value != 42 || len(thread.State.Log) != 1 {
+		t.Errorf("期望 flaky 成功后 Value=42 且 Log 长度为 1，实际: %+v", thread.State)
+	}
+
+	// ErrorHook 只应在 fatal 节点最终失败时触发 1 次（flaky 重试成功后不应触发 ErrorHook）
+	if errHookCalled != 1 || lastHookErr == nil || !strings.Contains(lastHookErr.Error(), "permanent auth error") {
+		t.Errorf("期望 ErrorHook 触发 1 次且记录 fatal 错误，实际次数=%d, err=%v", errHookCalled, lastHookErr)
+	}
+}
